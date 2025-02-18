@@ -1,73 +1,53 @@
-# Instructions
+# Web-scale Data Management Project Template
 
+Basic project structure with Python's Flask and Redis. 
+**You are free to use any web framework in any language and any database you like for this project.**
 
-## Setup 
-* Install python 3.8 or greater (tested with 3.12 on Linux)
-* Install the required packages using: `pip install -r requirements.txt`
-* Change the URLs and ports in the `urls.json` file with your own (currently set to the Gateway of the provided template)
+### Project structure
 
+* `env`
+    Folder containing the Redis env variables for the docker-compose deployment
+    
+* `helm-config` 
+   Helm chart values for Redis and ingress-nginx
+        
+* `k8s`
+    Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
+    
+* `order`
+    Folder containing the order application logic and dockerfile. 
+    
+* `payment`
+    Folder containing the payment application logic and dockerfile. 
 
-> Note: For Windows users you might also need to install pywin32
+* `stock`
+    Folder containing the stock application logic and dockerfile. 
 
+* `test`
+    Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
 
-## Consistency Test
+### Deployment types:
 
-In the provided consistency test we first populate the databases with 1 item with 100 stock that costs 1 credit 
-and 1000 users that have 1 credit. 
+#### docker-compose (local development)
 
-Then we concurrently send 1000 checkouts of 1 item with random user/item combinations.
-If everything goes well only ~10% of the checkouts will succeed, and the expected state should be 0 stock in the item 
-items and 100 credits subtracted across different users.  
+After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
+(you can use the provided tests in the `\test` folder and change them as you wish). 
 
-Finally, the measurements are done in two phases:
-1) Using logs to see whether the service sent the correct message to the clients
-2) Querying the database to see if the actual state remained consistent
+***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
-### Running
-* Run script `run_consistency_test.py`
+K8s is also possible, but we do not require it as part of your submission. 
 
-### Interpreting Results
+#### minikube (local k8s cluster)
 
-Wait for the script to finish and check how many inconsistencies you have in both the payment and stock services
+This setup is for local k8s testing to see if your k8s config works before deploying to the cloud. 
+First deploy your database using helm by running the `deploy-charts-minicube.sh` file (in this example the DB is Redis 
+but you can find any database you want in https://artifacthub.io/ and adapt the script). Then adapt the k8s configuration files in the
+`\k8s` folder to mach your system and then run `kubectl apply -f .` in the k8s folder. 
 
+***Requirements:*** You need to have minikube (with ingress enabled) and helm installed on your machine.
 
-## Stress Test
+#### kubernetes cluster (managed k8s cluster in the cloud)
 
-To run the stress test you have to:
+Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
 
-1) Open a terminal and navigate to the `stress-test` folder.
-
-2) Run the `init_orders.py` to initialize the databases with the following data:
-
-```txt
-NUMBER_0F_ITEMS = 100_000
-ITEM_STARTING_STOCK = 1_000_000
-ITEM_PRICE = 1
-NUMBER_OF_USERS = 100_000
-USER_STARTING_CREDIT = 1_000_000
-NUMBER_OF_ORDERS = 100_000
-```
-
-3) Run script: `locust -f locustfile.py --host="localhost"`
-
-> Note: you can also set the --processes flag to increase the amount of locust worker processes.
-
-4) Go to `http://localhost:8089/` to use the Locust.io UI.
-
-
-To change the weight (task frequency) of the provided scenarios you can change the weights in the `tasks` definition (line 358)
-With our locust file each user will make one request between 1 and 15 seconds (you can change that in line 356).
-
-> You can also create your own scenarios as you like (https://docs.locust.io/en/stable/writing-a-locustfile.html)
-
-
-### Using the Locust UI
-Fill in an appropriate number of users that you want to test with. 
-The hatch rate is how many users will spawn per second 
-(locust suggests that you should use less than 100 in local mode). 
-
-### Stress Test With Kubernetes 
-
-If you want to scale the `stress-test` to a Kubernetes clust you can follow the guide from 
-Google's [Distributed load testing using Google Kubernetes Engine](https://cloud.google.com/architecture/distributed-load-testing-using-gke)
-and [original repo](https://github.com/GoogleCloudPlatform/distributed-load-testing-using-kubernetes). 
+***Requirements:*** You need to have access to kubectl of a k8s cluster.
