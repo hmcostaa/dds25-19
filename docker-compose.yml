@@ -1,8 +1,15 @@
 version: "3"
 services:
+  rabbitmq:
+    image: rabbitmq:4.0-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
 
   gateway:
     image: nginx:1.25-bookworm
+    environment:
+      AMQP_URL: "amqp://rabbitmq?connection_attempts=5&retry_delay=5"
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -16,7 +23,8 @@ services:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
+      GATEWAY_URL: "http://gateway:80"
+      AMQP_URL: "amqp://rabbitmq?connection_attempts=5&retry_delay=5"
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -30,6 +38,8 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      AMQP_URL: "amqp://rabbitmq?connection_attempts=5&retry_delay=5"
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -43,6 +53,8 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    environment:
+      AMQP_URL: "amqp://rabbitmq?connection_attempts=5&retry_delay=5"
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
