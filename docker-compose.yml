@@ -16,12 +16,97 @@ services:
     command: hypercorn app -b 0.0.0.0:5000
     environment:
       AMQP_URL: "amqp://rabbitmq"
+  # ------------------------- API Gateway -------------------------
+#  gateway:
+#    image: nginx:1.25-bookworm
+#    volumes:
+#      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+#    ports:
+#      - "8000:80"
+#    depends_on:
+#      - order-service
+#      - stock-service
+#      - payment-service
+
+  # ------------------------- RabbitMQ (Message Broker) ------------------------
+
+  # ------------------------- Redis Sentinel Cluster ----------------------------
+  redis-sentinel-1:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-1
+    command: ["redis-sentinel", "/etc/redis/sentinel.txt"]
+    volumes:
+      - ./redis/sentinel.txt:/etc/redis/sentinel.txt
+    depends_on:
+      - redis-order-master
+      - redis-stock-master
+      - redis-payment-master
     ports:
       - "5000:5000"
     depends_on:
       rabbitmq:
         condition: service_healthy
 
+
+  redis-sentinel-2:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-2
+    command: ["redis-sentinel", "/etc/redis/sentinel.txt"]
+    ports:
+      - "26380:26379"
+
+  redis-sentinel-3:
+    image: redis:7.2-bookworm
+    container_name: redis-sentinel-3
+    command: ["redis-sentinel", "/etc/redis/sentinel.txt"]
+    ports:
+      - "26381:26379"
+
+  # ------------------------- Redis Master-Replica for Order Service ----------
+  redis-order-master:
+    image: redis:7.2-bookworm
+    container_name: redis-order-master
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    ports:
+      - "6379:6379"
+
+  redis-order-replica-1:
+    image: redis:7.2-bookworm
+    container_name: redis-order-replica-1
+    command: ["redis-server", "--replicaof", "redis-order-master", "6379", "--requirepass", "redis"]
+
+  redis-order-replica-2:
+    image: redis:7.2-bookworm
+    container_name: redis-order-replica-2
+    command: ["redis-server", "--replicaof", "redis-order-master", "6379", "--requirepass", "redis"]
+
+  # ------------------------- Redis Master-Replica for Stock Service ----------
+  redis-stock-master:
+    image: redis:7.2-bookworm
+    container_name: redis-stock-master
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    ports:
+      - "6380:6379"
+
+  redis-stock-replica-1:
+    image: redis:7.2-bookworm
+    container_name: redis-stock-replica-1
+    command: ["redis-server", "--replicaof", "redis-stock-master", "6379", "--requirepass", "redis"]
+
+  # ------------------------- Redis Master-Replica for Payment Service --------
+  redis-payment-master:
+    image: redis:7.2-bookworm
+    container_name: redis-payment-master
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    ports:
+      - "6381:6379"
+
+  redis-payment-replica-1:
+    image: redis:7.2-bookworm
+    container_name: redis-payment-replica-1
+    command: ["redis-server", "--replicaof", "redis-payment-master", "6379", "--requirepass", "redis"]
+
+  # ------------------------- Order Service -----------------------------------
   order-service:
     build: ./order
     image: order:latest
@@ -31,12 +116,11 @@ services:
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      - redis-order-master
+      - redis-sentinel-1
+      - rabbitmq
 
-  order-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
+  # ------------------------- Stock Service -----------------------------------
   stock-service:
     build: ./stock
     image: stock:latest
@@ -44,12 +128,11 @@ services:
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      - redis-stock-master
+      - redis-sentinel-1
+      - rabbitmq
 
-  stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
+  # ------------------------- Payment Service ---------------------------------
   payment-service:
     build: ./payment
     image: user:latest
@@ -68,3 +151,6 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+      - redis-payment-master
+      - redis-sentinel-1
+      - rabbitmq

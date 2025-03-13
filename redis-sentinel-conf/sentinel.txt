@@ -1,0 +1,8 @@
+port 26379
+sentinel monitor order-master redis-order-master 6379 2
+sentinel monitor stock-master redis-stock-master 6380 2
+sentinel monitor payment-master redis-payment-master 6381 2
+
+sentinel down-after-milliseconds order-master 5000
+sentinel failover-timeout order-master 10000
+sentinel parallel-syncs order-master 1
