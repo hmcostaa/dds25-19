@@ -5,12 +5,14 @@ import random
 import uuid
 from collections import defaultdict
 
+from click import password_option
+from redis.sentinel import (Sentinel)
+
 import redis
 import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -19,14 +21,17 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+sentinel= Sentinel([
+    (os.environ['REDIS_SENTINEL_1'],26379),
+    (os.environ['REDIS_SENTINEL_2'],26380),
+    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
+db_master=sentinel.master_for('order-master', socket_timeout=0.1, decoder_responses=True)
+db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decoder_responses=True)
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
 
 
 atexit.register(close_db_connection)
@@ -42,7 +47,7 @@ class OrderValue(Struct):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(order_id)
+        entry: bytes = db_slave.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -58,7 +63,7 @@ def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
-        db.set(key, value)
+        db_master.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
@@ -88,7 +93,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for orders successful"})
+    return jsonify({"msg": "Batch init for orderxs successful"})
 
 
 @app.get('/find/<order_id>')
@@ -134,7 +139,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
-        db.set(order_id, msgpack.encode(order_entry))
+        db_master.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
