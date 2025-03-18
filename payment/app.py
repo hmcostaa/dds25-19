@@ -2,6 +2,11 @@ import logging
 import os
 import atexit
 import uuid
+import asyncio
+import json
+
+from aio_pika import Message, connect_robust
+from aio_pika.abc import AbstractIncomingMessage
 
 import redis
 
@@ -106,8 +111,44 @@ def remove_credit(user_id: str, amount: int):
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
+async def main() -> None:
+    connection = await connect_robust(os.environ["AMQP_URL"])
+
+    async with connection:
+        channel = await connection.channel()
+        await channel.set_qos(prefetch_count=1)
+        exchange = channel.default_exchange
+
+        queue = await channel.declare_queue(
+            "payment_queue",
+            durable=True,
+        )
+
+        async with queue.iterator() as qiterator:
+            message: AbstractIncomingMessage
+            async for message in qiterator:
+                try:
+                    async with message.process():
+                        user_id: str = json.loads(message.body.decode())
+                        response = {
+                            "user_id": user_id,
+                            "credit": 100
+                        }
+                        await exchange.publish(
+                            Message(
+                                body=json.dumps(response).encode(),
+                                correlation_id=message.correlation_id,
+                            ),
+                            routing_key=message.reply_to,
+                        )
+                        print("Request complete")
+                except Exception:
+                    logging.exception("Processing error for message %r", message)
+
+
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    # app.run(host="0.0.0.0", port=8000, debug=True)
+    asyncio.run(main())
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers

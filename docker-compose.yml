@@ -5,12 +5,22 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
 
   gateway:
     build: ./gateway
     command: hypercorn app -b 0.0.0.0:5000
+    environment:
+      AMQP_URL: "amqp://rabbitmq"
     ports:
       - "5000:5000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
   order-service:
     build: ./order
@@ -43,11 +53,15 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      AMQP_URL: "amqp://rabbitmq"
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      rabbitmq:
+        condition: service_healthy
+      payment-db:
+        condition: service_started
 
   payment-db:
     image: redis:7.2-bookworm
