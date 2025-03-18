@@ -1,5 +1,11 @@
 version: "3"
 services:
+  rabbitmq:
+    image: rabbitmq:4.0-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
   gateway:
     build: ./gateway
     command: hypercorn app -b 0.0.0.0:5000
