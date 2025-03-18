@@ -3,10 +3,8 @@ import os
 import atexit
 import uuid
 import asyncio
-import json
 
-from aio_pika import Message, connect_robust
-from aio_pika.abc import AbstractIncomingMessage
+from common.amqp_worker import AMQPWorker
 
 import redis
 
@@ -49,15 +47,15 @@ def get_user_from_db(user_id: str) -> UserValue | None:
     return entry
 
 
-@app.post('/create_user')
-def create_user():
-    key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
+# @app.post('/create_user')
+# def create_user():
+#     key = str(uuid.uuid4())
+#     value = msgpack.encode(UserValue(credit=0))
+#     try:
+#         db.set(key, value)
+#     except redis.exceptions.RedisError:
+#         return abort(400, DB_ERROR_STR)
+#     return jsonify({'user_id': key})
 
 
 @app.post('/batch_init/<n>/<starting_money>')
@@ -73,15 +71,15 @@ def batch_init_users(n: int, starting_money: int):
     return jsonify({"msg": "Batch init for users successful"})
 
 
-@app.get('/find_user/<user_id>')
-def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
-    return jsonify(
-        {
-            "user_id": user_id,
-            "credit": user_entry.credit
-        }
-    )
+# @app.get('/find_user/<user_id>')
+# def find_user(user_id: str):
+#     user_entry: UserValue = get_user_from_db(user_id)
+#     return jsonify(
+#         {
+#             "user_id": user_id,
+#             "credit": user_entry.credit
+#         }
+#     )
 
 
 @app.post('/add_funds/<user_id>/<amount>')
@@ -111,45 +109,29 @@ def remove_credit(user_id: str, amount: int):
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
-async def main() -> None:
-    connection = await connect_robust(os.environ["AMQP_URL"])
+worker = AMQPWorker(
+    amqp_url=os.environ["AMQP_URL"],
+    queue_name="payment_queue",
+)
 
-    async with connection:
-        channel = await connection.channel()
-        await channel.set_qos(prefetch_count=1)
-        exchange = channel.default_exchange
 
-        queue = await channel.declare_queue(
-            "payment_queue",
-            durable=True,
-        )
+@worker.register
+async def find_user(data):
+    user_id = data.get("user_id")
+    response = {
+        "user_id": user_id,
+        "credit": 100
+    }
+    return response
 
-        async with queue.iterator() as qiterator:
-            message: AbstractIncomingMessage
-            async for message in qiterator:
-                try:
-                    async with message.process():
-                        user_id: str = json.loads(message.body.decode())
-                        response = {
-                            "user_id": user_id,
-                            "credit": 100
-                        }
-                        await exchange.publish(
-                            Message(
-                                body=json.dumps(response).encode(),
-                                correlation_id=message.correlation_id,
-                            ),
-                            routing_key=message.reply_to,
-                        )
-                        print("Request complete")
-                except Exception:
-                    logging.exception("Processing error for message %r", message)
+
+@worker.register
+async def create_user(data):
+    response = {
+        "user_id": "12345"  # Example response
+    }
+    return response
 
 
 if __name__ == '__main__':
-    # app.run(host="0.0.0.0", port=8000, debug=True)
-    asyncio.run(main())
-else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    asyncio.run(worker.start())

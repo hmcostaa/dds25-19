@@ -11,9 +11,25 @@ async def startup():
     await rpc_client.connect(os.environ["AMQP_URL"])
 
 
+@app.route("/payment/create_user")
+async def create_user():
+    payload = {
+        "type": "create_user",
+        "data": {}
+    }
+    response = await rpc_client.call(payload, "payment_queue")
+    return response
+
+
 @app.route("/payment/find_user/<user_id>")
 async def find_user(user_id):
-    response = await rpc_client.call(user_id, "payment_queue")
+    payload = {
+        "type": "find_user",
+        "data": {
+            "user_id": user_id
+        }
+    }
+    response = await rpc_client.call(payload, "payment_queue")
     return response
 
 

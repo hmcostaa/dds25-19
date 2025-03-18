@@ -53,6 +53,8 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    volumes:
+      - ./common:/usr/src/app/payment/common
     environment:
       AMQP_URL: "amqp://rabbitmq"
     env_file:
