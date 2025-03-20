@@ -1,0 +1,5 @@
+aio_pika==9.5.5
+asyncio==3.4.3
+Hypercorn==0.17.3
+Quart==0.20.0
+uuid==1.30

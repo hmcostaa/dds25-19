@@ -2,6 +2,9 @@ import logging
 import os
 import atexit
 import uuid
+import asyncio
+
+from common.amqp_worker import AMQPWorker
 
 import redis
 
@@ -64,15 +67,15 @@ def atomic_update_user(user_id: str, update_func):
         except redis.RedisError:
             abort(400, DB_ERROR_STR)
 
-@app.post('/create_user')
-def create_user():
-    key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key}), 200
+# @app.post('/create_user')
+# def create_user():
+#     key = str(uuid.uuid4())
+#     value = msgpack.encode(UserValue(credit=0))
+#     try:
+#         db.set(key, value)
+#     except redis.exceptions.RedisError:
+#         return abort(400, DB_ERROR_STR)
+#     return jsonify({'user_id': key})
 
 @app.post('/batch_init/<n>/<starting_money>')
 def batch_init_users(n: int, starting_money: int):
@@ -86,15 +89,16 @@ def batch_init_users(n: int, starting_money: int):
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"}),200
 
-@app.get('/find_user/<user_id>')
-def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
-    return jsonify(
-        {
-            "user_id": user_id,
-            "credit": user_entry.credit
-        }
-    ), 200
+
+# @app.get('/find_user/<user_id>')
+# def find_user(user_id: str):
+#     user_entry: UserValue = get_user_from_db(user_id)
+#     return jsonify(
+#         {
+#             "user_id": user_id,
+#             "credit": user_entry.credit
+#         }
+#     )
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
@@ -128,9 +132,29 @@ def cancel_payment(user_id: str, amount: int):
     # return Response(f"User: {user_id} credit updated to: {updated_user.credit}", status=200)
     return jsonify({"refunded": True, "credit": updated_user.credit}), 200
 
+worker = AMQPWorker(
+    amqp_url=os.environ["AMQP_URL"],
+    queue_name="payment_queue",
+)
+
+
+@worker.register
+async def find_user(data):
+    user_id = data.get("user_id")
+    response = {
+        "user_id": user_id,
+        "credit": 100
+    }
+    return response, 200
+
+
+@worker.register
+async def create_user(data):
+    response = {
+        "user_id": "12345"  # Example response
+    }
+    return "blah", 418
+
+
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
-else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    asyncio.run(worker.start())
