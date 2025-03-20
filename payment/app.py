@@ -1,7 +1,5 @@
-import logging
 import os
 import atexit
-import uuid
 import asyncio
 
 from redis import Sentinel

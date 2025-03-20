@@ -1,11 +1,11 @@
 FROM python:3.12-slim
 
-WORKDIR /home/flask-app
+WORKDIR /usr/src/app/order
 
 COPY ./requirements.txt .
 
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY *.py .
 
-EXPOSE 5000
+CMD ["python", "app.py"]
