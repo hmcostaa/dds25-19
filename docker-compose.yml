@@ -49,6 +49,11 @@ services:
       - "26379:26379"
     networks:
       - redis-cluster-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-sentinel-2:
     image: redis:7.2-bookworm
@@ -62,6 +67,11 @@ services:
       - redis-cluster-network
     depends_on:
       - redis-sentinel-1
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-sentinel-3:
     image: redis:7.2-bookworm
@@ -75,6 +85,11 @@ services:
       - redis-cluster-network
     depends_on:
       - redis-sentinel-1
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ------------------------- Redis Master-Replica for Order Service ----------
   redis-order-master:
@@ -85,6 +100,11 @@ services:
       - "6379:6379"
     networks:
       - redis-cluster-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-order-replica-1:
     image: redis:7.2-bookworm
@@ -94,6 +114,7 @@ services:
       - redis-cluster-network
     depends_on:
       - redis-order-master
+
 
   redis-order-replica-2:
     image: redis:7.2-bookworm
@@ -113,6 +134,11 @@ services:
       - "6380:6379"
     networks:
       - redis-cluster-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-stock-replica-1:
     image: redis:7.2-bookworm
@@ -141,6 +167,11 @@ services:
       - "6381:6379"
     networks:
       - redis-cluster-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-payment-replica-1:
     image: redis:7.2-bookworm
@@ -172,30 +203,35 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-order-master
-      - redis-sentinel-1
-      - rabbitmq
-
-  order-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+      redis-order-master:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   stock-service:
     build: ./stock
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
     env_file:
       - env/stock_redis.env
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-stock-master
-      - redis-sentinel-1
-      - rabbitmq
-
-  stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+      redis-stock-master:
+         condition: service_healthy
+      redis-sentinel-1:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
 
   payment-service:
     build: ./payment
@@ -213,3 +249,5 @@ services:
         condition: service_healthy
       redis-payment-master:
         condition: service_started
+      redis-sentinel-1:
+        condition: service_healthy
