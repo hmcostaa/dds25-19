@@ -23,26 +23,19 @@ async def create_order(user_id):
     return response
 
 # The following routes are used to interact with the payment service
-@app.route("/payment/create_user")
+@app.route("/payment/create_user", methods=["POST"])
 async def create_user():
-    payload = {
-        "type": "create_user",
-        "data": {}
-    }
-    response = await rpc_client.call(payload, "payment_queue")
-    return response
+    response, code = await rpc_client.call(queue="payment_queue",
+                                           action="create_user")
+    return response, code
 
 
-@app.route("/payment/find_user/<user_id>")
+@app.route("/payment/find_user/<user_id>", methods=["GET"])
 async def find_user(user_id):
-    payload = {
-        "type": "find_user",
-        "data": {
-            "user_id": user_id
-        }
-    }
-    response = await rpc_client.call(payload, "payment_queue")
-    return response
+    response, code = await rpc_client.call(queue="payment_queue",
+                                           action="find_user",
+                                           payload={"user_id": user_id})
+    return response, code
 
 if __name__ == "__main__":
     app.run()

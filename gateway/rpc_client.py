@@ -1,7 +1,7 @@
 import json
 import uuid
 import asyncio
-from typing import MutableMapping
+from typing import MutableMapping, Tuple
 from aio_pika import Message, connect_robust
 from aio_pika.abc import (
     AbstractChannel, AbstractConnection,
@@ -33,7 +33,7 @@ class RpcClient:
         future: asyncio.Future = self.futures.pop(message.correlation_id)
         future.set_result(json.loads(message.body.decode()))
 
-    async def call(self, payload: object, queue: str) -> object:
+    async def call(self, queue: str, action: str, payload: object = {}) -> Tuple[object, int]:
         correlation_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future = loop.create_future()
