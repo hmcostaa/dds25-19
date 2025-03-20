@@ -272,7 +272,30 @@ services:
       timeout: 5s
       retries: 5
 
-  # ------------------------- Order Service -----------------------------------
+  # ------------------------- Order Service & Orchestrator -----------------------------------
+  order-orchestrator:
+    build: ./order/order-orchestrator
+    image: order-orchestrator:latest
+    environment:
+      - AMQP_URL=amqp://user:password@rabbitmq:5672/
+      - ORDER_SERVICE_URL=http://order-service:5000
+      - SAGA_REDIS_HOST=redis-saga-master
+      - SAGA_REDIS_PORT=6379
+      - SAGA_REDIS_PASSWORD=redis
+      - SAGA_REDIS_DB=1
+    networks:
+      - redis-cluster-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   order-service:
     build: ./order
     image: order:latest
@@ -281,7 +304,7 @@ services:
       - SAGA_REDIS_HOST=redis-saga-master
       - SAGA_REDIS_PORT=6379
       - SAGA_REDIS_PASSWORD=redis
-      - SAGA_REDIS_DB=0
+      - SAGA_REDIS_DB=1
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -302,6 +325,30 @@ services:
       timeout: 5s
       retries: 5
 
+  # ------------------------- Stock Service & Orchestrator -----------------------------------
+  stock-orchestrator:
+    build: ./stock/stock-orchestrator
+    image: stock-orchestrator:latest
+    environment:
+      - AMQP_URL=amqp://user:password@rabbitmq:5672/
+      - STOCK_SERVICE_URL=http://stock-service:5000
+      - SAGA_REDIS_HOST=redis-saga-master
+      - SAGA_REDIS_PORT=6379
+      - SAGA_REDIS_PASSWORD=redis
+      - SAGA_REDIS_DB=1
+    networks:
+      - redis-cluster-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   stock-service:
     build: ./stock
     image: stock:latest
@@ -311,7 +358,7 @@ services:
       SAGA_REDIS_HOST: redis-saga-master
       SAGA_REDIS_PORT: 6379
       SAGA_REDIS_PASSWORD: redis
-      SAGA_REDIS_DB: 0
+      SAGA_REDIS_DB: 1
     env_file:
       - env/stock_redis.env
     networks:
@@ -331,6 +378,35 @@ services:
       timeout: 5s
       retries: 5
 
+  # ------------------------- Payment Service & Orchestrator -----------------------------------
+  payment-orchestrator:
+    build: ./payment/payment-orchestrator
+    image: payment-orchestrator:latest
+    environment:
+      - AMQP_URL=amqp://user:password@rabbitmq:5672/
+      - PAYMENT_SERVICE_URL=http://payment-service:5000
+      - SAGA_REDIS_HOST=redis-saga-master
+      - SAGA_REDIS_PORT=6379
+      - SAGA_REDIS_PASSWORD=redis
+      - SAGA_REDIS_DB=1
+    deploy:
+      replicas: 2  # Run multiple instances
+    restart: always
+    volumes:
+      - ./orchestrator-logs:/app/logs
+    networks:
+      - redis-cluster-network
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   payment-service:
     build: ./payment
     image: payment:latest
@@ -341,7 +417,7 @@ services:
       SAGA_REDIS_HOST: redis-saga-master
       SAGA_REDIS_PORT: 6379
       SAGA_REDIS_PASSWORD: redis
-      SAGA_REDIS_DB: 0
+      SAGA_REDIS_DB: 1
     env_file:
       - env/payment_redis.env
     networks:
