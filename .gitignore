@@ -1,2 +1,5 @@
-/venv
-bin
+bin# Byte-compiled files
+__pycache__/
+
+# Environments
+.venv/
