@@ -10,7 +10,19 @@ rpc_client = RpcClient()
 async def startup():
     await rpc_client.connect(os.environ["AMQP_URL"])
 
+# The following routes are used to interact with the order service
+@app.route("/order/create_order/<user_id>")
+async def create_order(user_id):
+    payload = {
+        "type": "create_order",
+        "data": {
+            "user_id": user_id
+        }
+    }
+    response = await rpc_client.call(payload, "order_queue")
+    return response
 
+# The following routes are used to interact with the payment service
 @app.route("/payment/create_user")
 async def create_user():
     payload = {
@@ -31,7 +43,6 @@ async def find_user(user_id):
     }
     response = await rpc_client.call(payload, "payment_queue")
     return response
-
 
 if __name__ == "__main__":
     app.run()

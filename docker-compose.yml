@@ -25,13 +25,17 @@ services:
   order-service:
     build: ./order
     image: order:latest
+    volumes:
+      - ./common:/usr/src/app/order/common
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      AMQP_URL: "amqp://rabbitmq"
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      rabbitmq:
+        condition: service_healthy
+      order-db:
+        condition: service_started
 
   order-db:
     image: redis:7.2-bookworm
