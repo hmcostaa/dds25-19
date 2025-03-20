@@ -47,9 +47,8 @@ class AMQPWorker:
                     try:
                         async with message.process():
                             # Decode the message body
-                            payload = json.loads(message.body.decode())
-                            message_type = payload.get("type")
-                            data = payload.get("data")
+                            data = json.loads(message.body.decode())
+                            message_type = message.type
 
                             # Find the appropriate callback
                             if message_type in self.callbacks:
