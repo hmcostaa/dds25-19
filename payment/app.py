@@ -10,6 +10,7 @@ from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 
+#pytest --maxfail=1 --disable-warnings -q
 
 app = Flask("payment-service")
 
@@ -43,6 +44,25 @@ def get_user_from_db(user_id: str) -> UserValue | None:
         abort(400, f"User: {user_id} not found!")
     return entry
 
+def atomic_update_user(user_id: str, update_func):
+    while True:
+        try:
+            pipe = db.pipeline(transaction=True) #create redis ppipeline
+            pipe.watch(user_id)
+            entry = pipe.get(user_id)
+            user_val: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
+            if user_val is None:
+                pipe.reset()
+                abort(400, f"User: {user_id} not found!")
+            updated_user = update_func(user_val)
+            pipe.multi()
+            pipe.set(user_id, msgpack.encode(updated_user))
+            pipe.execute() #execute if no other client modified user_id (pipe.watch)
+            break
+        except redis.WatchError:
+            continue 
+        except redis.RedisError:
+            abort(400, DB_ERROR_STR)
 
 @app.post('/create_user')
 def create_user():
@@ -52,8 +72,7 @@ def create_user():
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
-
+    return jsonify({'user_id': key}), 200
 
 @app.post('/batch_init/<n>/<starting_money>')
 def batch_init_users(n: int, starting_money: int):
@@ -65,8 +84,7 @@ def batch_init_users(n: int, starting_money: int):
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for users successful"})
-
+    return jsonify({"msg": "Batch init for users successful"}),200
 
 @app.get('/find_user/<user_id>')
 def find_user(user_id: str):
@@ -76,35 +94,39 @@ def find_user(user_id: str):
             "user_id": user_id,
             "credit": user_entry.credit
         }
-    )
-
+    ), 200
 
 @app.post('/add_funds/<user_id>/<amount>')
 def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
-
+    def updater(user: UserValue) -> UserValue:
+        user.credit += int(amount)
+        return user
+    atomic_update_user(user_id, updater)
+    updated_user = get_user_from_db(user_id)
+    # return Response(f"User: {user_id} credit updated to: {updated_user.credit}", status=200)
+    return jsonify({"done": True, "credit": updated_user.credit}), 200
 
 @app.post('/pay/<user_id>/<amount>')
 def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+    def updater(user: UserValue) -> UserValue:
+        if user.credit < int(amount):
+            abort(400, f"User: {user_id} has insufficient credit!")
+        user.credit -= int(amount)
+        return user
+    atomic_update_user(user_id, updater)
+    updated_user = get_user_from_db(user_id)
+    # return Response(f"User: {user_id} credit updated to: {updated_user.credit}", status=200)
+    return jsonify({"paid": True, "credit": updated_user.credit}), 200
 
+@app.post('/cancel/<user_id>/<amount>')
+def cancel_payment(user_id: str, amount: int):
+    def updater(user: UserValue) -> UserValue:
+        user.credit += int(amount)
+        return user
+    atomic_update_user(user_id, updater)
+    updated_user = get_user_from_db(user_id)
+    # return Response(f"User: {user_id} credit updated to: {updated_user.credit}", status=200)
+    return jsonify({"refunded": True, "credit": updated_user.credit}), 200
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
