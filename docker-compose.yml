@@ -176,7 +176,10 @@ services:
       - redis-sentinel-1
       - rabbitmq
 
-  # ------------------------- Stock Service -----------------------------------
+  order-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
   stock-service:
     build: ./stock
     image: stock:latest
@@ -190,7 +193,10 @@ services:
       - redis-sentinel-1
       - rabbitmq
 
-  # ------------------------- Payment Service ---------------------------------
+  stock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
   payment-service:
     build: ./payment
     image: payment:latest
