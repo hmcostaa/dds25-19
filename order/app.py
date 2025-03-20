@@ -185,6 +185,7 @@ worker = AMQPWorker(
     queue_name="order_queue",
 )
 
+
 @worker.register
 async def create_order(data):
     key = str(uuid.uuid4())
@@ -193,13 +194,9 @@ async def create_order(data):
     try:
         db.set(key, value)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return {"order_id": key}
+        return DB_ERROR_STR, 400
+    return {"order_id": key}, 200
 
 
 if __name__ == '__main__':
     asyncio.run(worker.start())
-else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)

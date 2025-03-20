@@ -13,16 +13,12 @@ async def startup():
 # The following routes are used to interact with the order service
 
 
-@app.route("/order/create_order/<user_id>")
+@app.route("/order/create_order/<user_id>", methods=["POST"])
 async def create_order(user_id):
-    payload = {
-        "type": "create_order",
-        "data": {
-            "user_id": user_id
-        }
-    }
-    response = await rpc_client.call(payload, "order_queue")
-    return response
+    response, code = await rpc_client.call(queue="order_queue",
+                                           action="create_order",
+                                           payload={"user_id": user_id})
+    return response, code
 
 # The following routes are used to interact with the payment service
 
