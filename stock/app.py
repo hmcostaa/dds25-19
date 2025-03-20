@@ -2,7 +2,8 @@ import logging
 import os
 import atexit
 import uuid
-
+import asyncio
+from common.amqp_worker import AMQPWorker
 import redis
 
 from msgspec import msgpack, Struct
@@ -45,16 +46,16 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     return entry
 
 
-@app.post('/item/create/<price>')
-def create_item(price: int):
-    key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
+# @app.post('/item/create/<price>')
+# def create_item(price: int):
+#     key = str(uuid.uuid4())
+#     app.logger.debug(f"Item: {key} created")
+#     value = msgpack.encode(StockValue(stock=0, price=int(price)))
+#     try:
+#         db.set(key, value)
+#     except redis.exceptions.RedisError:
+#         return abort(400, DB_ERROR_STR)
+#     return jsonify({'item_id': key})
 
 
 @app.post('/batch_init/<n>/<starting_stock>/<item_price>')
@@ -71,27 +72,27 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
     return jsonify({"msg": "Batch init for stock successful"})
 
 
-@app.get('/find/<item_id>')
-def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify(
-        {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
-    )
+# @app.get('/find/<item_id>')
+# def find_item(item_id: str):
+#     item_entry: StockValue = get_item_from_db(item_id)
+#     return jsonify(
+#         {
+#             "stock": item_entry.stock,
+#             "price": item_entry.price
+#         }
+#     )
 
 
-@app.post('/add/<item_id>/<amount>')
-def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+# @app.post('/add/<item_id>/<amount>')
+# def add_stock(item_id: str, amount: int):
+#     item_entry: StockValue = get_item_from_db(item_id)
+#     # update stock, serialize and update database
+#     item_entry.stock += int(amount)
+#     try:
+#         db.set(item_id, msgpack.encode(item_entry))
+#     except redis.exceptions.RedisError:
+#         return abort(400, DB_ERROR_STR)
+#     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
 @app.post('/subtract/<item_id>/<amount>')
@@ -108,9 +109,47 @@ def remove_stock(item_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
+worker = AMQPWorker(
+    amqp_url=os.environ["AMQP_URL"],
+    queue_name="stock_queue",
+)
+
+@worker.register
+async def find_item(data):
+    item_id = data.get("item_id")
+    item_entry: StockValue = get_item_from_db(item_id)
+    return {
+            "stock": item_entry.stock,
+            "price": item_entry.price
+        }
+
+@worker.register
+async def create_item(data):
+    price = data.get("price")
+    key = str(uuid.uuid4())
+    app.logger.debug(f"Item: {key} created")
+    value = msgpack.encode(StockValue(stock=0, price=int(price)))
+    try:
+        db.set(key, value)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return {'item_id': key}
+
+@worker.register
+def add_stock(data):
+    item_id = data.get("item_id")
+    amount = data.get("amount")
+    item_entry: StockValue = get_item_from_db(item_id)
+    # update stock, serialize and update database
+    item_entry.stock += int(amount)
+    try:
+        db.set(item_id, msgpack.encode(item_entry))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return {"msg": f"Item: {item_id} stock updated to: {item_entry.stock}"}
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    asyncio.run(worker.start())
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers

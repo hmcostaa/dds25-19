@@ -5,7 +5,7 @@ import random
 import uuid
 from collections import defaultdict
 import asyncio
-
+from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
 
 import redis
@@ -42,56 +42,45 @@ class OrderValue(Struct):
     total_cost: int
 
 
-# def get_order_from_db(order_id: str) -> OrderValue | None:
-#     try:
-#         # get serialized data
-#         entry: bytes = db.get(order_id)
-#     except redis.exceptions.RedisError:
-#         return abort(400, DB_ERROR_STR)
-#     # deserialize data if it exists else return null
-#     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-#     if entry is None:
-#         # if order does not exist in the database; abort
-#         abort(400, f"Order: {order_id} not found!")
-#     return entry
+def get_order_from_db(order_id: str) -> OrderValue | None:
+    try:
+        # get serialized data
+        entry: bytes = db.get(order_id)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    # deserialize data if it exists else return null
+    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
+    if entry is None:
+        # if order does not exist in the database; abort
+        abort(400, f"Order: {order_id} not found!")
+    return entry
 
 
-# @app.post('/create/<user_id>')
-# def create_order(user_id: str):
-#     key = str(uuid.uuid4())
-#     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
-#     try:
-#         db.set(key, value)
-#     except redis.exceptions.RedisError:
-#         return abort(400, DB_ERROR_STR)
-#     return jsonify({'order_id': key})
+@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
+    n = int(n)
+    n_items = int(n_items)
+    n_users = int(n_users)
+    item_price = int(item_price)
 
-# @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-# def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+    def generate_entry() -> OrderValue:
+        user_id = random.randint(0, n_users - 1)
+        item1_id = random.randint(0, n_items - 1)
+        item2_id = random.randint(0, n_items - 1)
+        value = OrderValue(paid=False,
+                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+                           user_id=f"{user_id}",
+                           total_cost=2*item_price)
+        return value
 
-#     n = int(n)
-#     n_items = int(n_items)
-#     n_users = int(n_users)
-#     item_price = int(item_price)
-
-#     def generate_entry() -> OrderValue:
-#         user_id = random.randint(0, n_users - 1)
-#         item1_id = random.randint(0, n_items - 1)
-#         item2_id = random.randint(0, n_items - 1)
-#         value = OrderValue(paid=False,
-#                            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-#                            user_id=f"{user_id}",
-#                            total_cost=2*item_price)
-#         return value
-
-#     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-#                                   for i in range(n)}
-#     try:
-#         db.mset(kv_pairs)
-#     except redis.exceptions.RedisError:
-#         return abort(400, DB_ERROR_STR)
-#     return jsonify({"msg": "Batch init for orders successful"})
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
+                                  for i in range(n)}
+    try:
+        db.mset(kv_pairs)
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return jsonify({"msg": "Batch init for orders successful"})
 
 
 # @app.get('/find/<order_id>')
@@ -185,9 +174,17 @@ worker = AMQPWorker(
     queue_name="order_queue",
 )
 
+# Initialize RpcClient for the order service
+rpc_client = RpcClient()
+
+@worker.before_start
+async def connect_rpc_client():
+    # Connect the RpcClient to the AMQP server
+    await rpc_client.connect(os.environ["AMQP_URL"])
 
 @worker.register
 async def create_order(data):
+    user_id = data.get("user_id")
     key = str(uuid.uuid4())
     user_id = data.get("user_id")
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
@@ -197,6 +194,106 @@ async def create_order(data):
         return DB_ERROR_STR, 400
     return {"order_id": key}, 200
 
+@worker.register
+async def find_order(data):
+    order_id = data.get("order_id")
+    order_entry: OrderValue = get_order_from_db(order_id)
+    return {
+            "order_id": order_id,
+            "paid": order_entry.paid,
+            "items": order_entry.items,
+            "user_id": order_entry.user_id,
+            "total_cost": order_entry.total_cost
+        }
+
+@worker.register
+async def add_item(data):
+    # order_id: str, item_id: str, quantity: int
+    order_id = data.get("order_id")
+    item_id = data.get("item_id")
+    quantity = data.get("quantity")
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # Prepare the payload for the stock service
+    payload = {
+        "type": "find_item",  # Message type for the stock service
+        "data": {
+            "item_id": item_id
+        }
+    }
+
+    stock_response = await rpc_client.call(payload, "stock_queue")
+
+    # Check if the stock service returned an error
+    if not stock_response or "error" in stock_response:
+        abort(400, f"Item: {item_id} does not exist or stock service error!")
+
+    # Extract item details from the stock service response
+    item_price = stock_response.get("price")
+    if item_price is None:
+        abort(400, f"Item: {item_id} price not found!")
+
+    # Update the order with the new item
+    order_entry.items.append((item_id, int(quantity)))
+    order_entry.total_cost += int(quantity) * item_price
+
+    # Save the updated order back to the database
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+    return {"order_id": key}
+
+@worker.register
+async def find_order(data):
+    order_id = data.get("order_id")
+    order_entry: OrderValue = get_order_from_db(order_id)
+    return {
+            "order_id": order_id,
+            "paid": order_entry.paid,
+            "items": order_entry.items,
+            "user_id": order_entry.user_id,
+            "total_cost": order_entry.total_cost
+        }
+
+@worker.register
+async def add_item(data):
+    # order_id: str, item_id: str, quantity: int
+    order_id = data.get("order_id")
+    item_id = data.get("item_id")
+    quantity = data.get("quantity")
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # Prepare the payload for the stock service
+    payload = {
+        "type": "find_item",  # Message type for the stock service
+        "data": {
+            "item_id": item_id
+        }
+    }
+
+    stock_response = await rpc_client.call(payload, "stock_queue")
+
+    # Check if the stock service returned an error
+    if not stock_response or "error" in stock_response:
+        abort(400, f"Item: {item_id} does not exist or stock service error!")
+
+    # Extract item details from the stock service response
+    item_price = stock_response.get("price")
+    if item_price is None:
+        abort(400, f"Item: {item_id} price not found!")
+
+    # Update the order with the new item
+    order_entry.items.append((item_id, int(quantity)))
+    order_entry.total_cost += int(quantity) * item_price
+
+    # Save the updated order back to the database
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        return abort(400, DB_ERROR_STR)
+
+    return {"msg": f"Item: {item_id} added to order: {order_id}, total cost updated to: {order_entry.total_cost}"}
 
 if __name__ == '__main__':
     asyncio.run(worker.start())
