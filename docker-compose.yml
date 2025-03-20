@@ -45,6 +45,7 @@ services:
       - redis-order-master
       - redis-payment-master
       - redis-stock-master
+      - redis-saga-master
     ports:
       - "26379:26379"
     networks:
@@ -101,7 +102,7 @@ services:
     networks:
       - redis-cluster-network
     healthcheck:
-      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -113,8 +114,13 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-order-master
-
+      redis-order-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-order-replica-2:
     image: redis:7.2-bookworm
@@ -123,7 +129,13 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-order-master
+      redis-order-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ------------------------- Redis Master-Replica for Stock Service ----------
   redis-stock-master:
@@ -135,7 +147,7 @@ services:
     networks:
       - redis-cluster-network
     healthcheck:
-      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -147,7 +159,13 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-stock-master
+      redis-stock-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-stock-replica-2:
     image: redis:7.2-bookworm
@@ -156,7 +174,13 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-stock-master
+      redis-stock-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ------------------------- Redis Master-Replica for Payment Service --------
   redis-payment-master:
@@ -168,7 +192,7 @@ services:
     networks:
       - redis-cluster-network
     healthcheck:
-      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -180,7 +204,13 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-payment-master
+      redis-payment-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis-payment-replica-2:
     image: redis:7.2-bookworm
@@ -189,7 +219,58 @@ services:
     networks:
       - redis-cluster-network
     depends_on:
-      - redis-payment-master
+      redis-payment-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------- Redis Master-Replica for Saga State Repository --------
+  redis-saga-master:
+    image: redis:7.2-bookworm
+    container_name: redis-saga-master
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    ports:
+      - "6382:6379"
+    networks:
+      - redis-cluster-network
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-saga-replica-1:
+    image: redis:7.2-bookworm
+    container_name: redis-saga-replica-1
+    command: ["redis-server", "--replicaof", "redis-saga-master", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+    networks:
+      - redis-cluster-network
+    depends_on:
+      redis-saga-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis-saga-replica-2:
+    image: redis:7.2-bookworm
+    container_name: redis-saga-replica-2
+    command: ["redis-server", "--replicaof", "redis-saga-master", "6379", "--masterauth", "redis", "--requirepass", "redis"]
+    networks:
+      - redis-cluster-network
+    depends_on:
+      redis-saga-master:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # ------------------------- Order Service -----------------------------------
   order-service:
@@ -197,6 +278,10 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:5000
+      - SAGA_REDIS_HOST=redis-saga-master
+      - SAGA_REDIS_PORT=6379
+      - SAGA_REDIS_PASSWORD=redis
+      - SAGA_REDIS_DB=0
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -205,12 +290,14 @@ services:
     depends_on:
       redis-order-master:
         condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
       rabbitmq:
         condition: service_healthy
       redis-sentinel-1:
         condition: service_healthy
     healthcheck:
-      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -221,6 +308,10 @@ services:
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+      SAGA_REDIS_HOST: redis-saga-master
+      SAGA_REDIS_PORT: 6379
+      SAGA_REDIS_PASSWORD: redis
+      SAGA_REDIS_DB: 0
     env_file:
       - env/stock_redis.env
     networks:
@@ -228,10 +319,17 @@ services:
     depends_on:
       redis-stock-master:
          condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
       redis-sentinel-1:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   payment-service:
     build: ./payment
@@ -240,6 +338,10 @@ services:
       - ./common:/usr/src/app/payment/common
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+      SAGA_REDIS_HOST: redis-saga-master
+      SAGA_REDIS_PORT: 6379
+      SAGA_REDIS_PASSWORD: redis
+      SAGA_REDIS_DB: 0
     env_file:
       - env/payment_redis.env
     networks:
@@ -248,6 +350,13 @@ services:
       rabbitmq:
         condition: service_healthy
       redis-payment-master:
-        condition: service_started
+        condition: service_healthy
+      redis-saga-master:
+        condition: service_healthy
       redis-sentinel-1:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

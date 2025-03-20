@@ -7,20 +7,24 @@ import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-
+from redis import Sentinel
 
 DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
 
+sentinel= Sentinel([
+    (os.environ['REDIS_SENTINEL_1'],26379),
+    (os.environ['REDIS_SENTINEL_2'],26380),
+    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
+
+db_master=sentinel.master_for('order-master', socket_timeout=0.1, decoder_responses=True)
+db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decoder_responses=True)
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
 
 
 atexit.register(close_db_connection)
