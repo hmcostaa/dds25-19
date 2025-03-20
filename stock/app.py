@@ -44,6 +44,44 @@ def get_item_from_db(item_id: str) -> StockValue | None:
         abort(400, f"Item: {item_id} not found!")
     return entry
 
+def atomic_update_item(item_id: str, update_func):
+    while True:
+        try:
+            pipe = db.pipeline(transaction=True)  # Create Redis pipeline
+
+            pipe.watch(item_id)  # Watch the item_id for changes
+            entry = pipe.get(item_id)  # Retrieve the current value for item_id
+
+            item_val: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
+
+            # If the item value is None, abort and return an error message
+            if item_val is None:
+                pipe.reset()  # Reset the pipeline
+                abort(400, f"Item: {item_val} not found!")  # Return 400 error with message
+
+            updated_item = update_func(item_val)
+
+            pipe.multi()  # Start a transaction block
+
+            # Serialize and set the updated item value in Redis
+            pipe.set(item_val, msgpack.encode(updated_item))
+
+            # Execute the transaction if no one else modified the item_id (based on pipe.watch)
+            pipe.execute()
+
+            break  # Exit the loop if the transaction is successful
+
+        except redis.WatchError:
+            continue  # Retry the entire operation
+
+        except redis.RedisError:
+            # Catch any other Redis-related errors and abort with a 400 status
+            abort(400, DB_ERROR_STR)
+
+        except Exception as e:
+            # Catch any other unexpected exceptions to prevent silent failures
+            abort(401, f"Unexpected error: {str(e)}")
+
 
 @app.post('/item/create/<price>')
 def create_item(price: int):
@@ -54,7 +92,11 @@ def create_item(price: int):
         db.set(key, value)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
+    except Exception as e:
+        # Catch any other unexpected exceptions to prevent silent failures
+        abort(401, f"Unexpected error: {str(e)}")
+
+    return jsonify({'item_id': key}), 200
 
 
 @app.post('/batch_init/<n>/<starting_stock>/<item_price>')
@@ -68,7 +110,12 @@ def batch_init_users(n: int, starting_stock: int, item_price: int):
         db.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
+    except Exception as e:
+        # Catch any other unexpected exceptions to prevent silent failures
+        abort(401, f"Unexpected error: {str(e)}")
+
+
+    return jsonify({"msg": "Batch init for stock successful"}), 200
 
 
 @app.get('/find/<item_id>')
@@ -79,34 +126,29 @@ def find_item(item_id: str):
             "stock": item_entry.stock,
             "price": item_entry.price
         }
-    )
+    ), 200
 
 
 @app.post('/add/<item_id>/<amount>')
 def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+    def stock_value_change(item: StockValue) -> StockValue:
+        item.stock += int(amount)
+        return item
+    atomic_update_item(item_id,stock_value_change)
+    updated_item = get_item_from_db(item_id)
+    return jsonify({"Added": True, "UpdatedStock": updated_item.stock}), 200
 
 
 @app.post('/subtract/<item_id>/<amount>')
 def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+    def stock_value_change(item: StockValue) -> StockValue:
+        if item.stock - int(amount) < 0:
+            abort(400, f"Item: {item_id} has insufficient stock!")
+        item.stock -= int(amount)
+        return item
+    atomic_update_item(item_id,stock_value_change)
+    updated_item = get_item_from_db(item_id)
+    return jsonify({"Removed": True, "UpdatedStock": updated_item.stock}), 200
 
 
 if __name__ == '__main__':
