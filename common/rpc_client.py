@@ -33,7 +33,7 @@ class RpcClient:
         future: asyncio.Future = self.futures.pop(message.correlation_id)
         future.set_result(json.loads(message.body.decode()))
 
-    async def call(self, queue: str, action: str, payload: object = None) -> object:
+    async def call(self, payload: object, queue: str) -> object:
         correlation_id = str(uuid.uuid4())
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -46,7 +46,6 @@ class RpcClient:
                 content_type="application/json",
                 correlation_id=correlation_id,
                 reply_to=self.callback_queue.name,
-                type=action,
             ),
             routing_key=queue,
         )

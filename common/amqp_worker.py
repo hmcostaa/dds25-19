@@ -14,6 +14,7 @@ class AMQPWorker:
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.callbacks = {}
+        self.startup_callbacks = []
 
     def register(self, callback):
         """
@@ -26,10 +27,29 @@ class AMQPWorker:
         self.callbacks[message_type] = callback
         print(f"Registered callback for message type: '{message_type}'")
 
+    def before_start(self, callback):
+        """
+        Register a callback to be executed before the worker starts.
+        :param callback: The function to execute during startup.
+        """
+        if not callable(callback):
+            raise ValueError(f"Provided callback '{callback}' is not callable.")
+        self.startup_callbacks.append(callback)
+
+    async def startup(self):
+        """
+        Execute all registered startup callbacks.
+        """
+        for callback in self.startup_callbacks:
+            await callback()
+
     async def start(self):
         """
         Start consuming messages from the queue.
         """
+        # Execute startup logic before starting the worker
+        await self.startup()
+
         connection = await connect_robust(self.amqp_url)
         async with connection:
             channel = await connection.channel()
@@ -47,9 +67,8 @@ class AMQPWorker:
                     try:
                         async with message.process():
                             # Decode the message body
-                            payload = json.loads(message.body.decode())
-                            message_type = payload.get("type")
-                            data = payload.get("data")
+                            data = json.loads(message.body.decode())
+                            message_type = message.type
 
                             # Find the appropriate callback
                             if message_type in self.callbacks:

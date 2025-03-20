@@ -125,7 +125,7 @@ async def find_user(data):
         "user_id": user_id,
         "credit": 100
     }
-    return response
+    return response, 200
 
 
 @worker.register
@@ -133,7 +133,7 @@ async def create_user(data):
     response = {
         "user_id": "12345"  # Example response
     }
-    return response
+    return "blah", 418
 
 
 if __name__ == '__main__':
