@@ -69,7 +69,7 @@ async def subtract_item(item_id, amount):
         "amount": amount
     }
     response, code = await rpc_client.call(queue="stock_queue",
-                                           action="subtract_item",
+                                           action="remove_stock",
                                            payload=payload)
     return response, code
 
@@ -81,7 +81,7 @@ async def add_stock_item(item_id, amount):
         "amount": amount
     }
     response, code = await rpc_client.call(queue="stock_queue",
-                                           action="add_item",
+                                           action="add_stock",
                                            payload=payload)
     return response, code
 

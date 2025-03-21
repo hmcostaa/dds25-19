@@ -48,11 +48,13 @@ services:
       - ./common:/usr/src/app/stock/common    
     environment:
       AMQP_URL: "amqp://rabbitmq"    
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      rabbitmq:
+        condition: service_healthy
+      stock-db:
+        condition: service_started
 
   stock-db:
     image: redis:7.2-bookworm
