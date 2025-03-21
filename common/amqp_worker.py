@@ -1,10 +1,16 @@
 import json
 import logging
 from aio_pika import Message, connect_robust
-from aio_pika.abc import AbstractIncomingMessage
+from aio_pika.abc import (
+    AbstractChannel, AbstractConnection,
+    AbstractIncomingMessage
+)
 
 
 class AMQPWorker:
+    connection: AbstractConnection
+    channel: AbstractChannel
+
     def __init__(self, amqp_url: str, queue_name: str):
         """
         Initialize the AMQPConsumer.
@@ -30,13 +36,13 @@ class AMQPWorker:
         """
         Start consuming messages from the queue.
         """
-        connection = await connect_robust(self.amqp_url)
-        async with connection:
-            channel = await connection.channel()
-            await channel.set_qos(prefetch_count=1)
-            exchange = channel.default_exchange
+        self.connection = await connect_robust(self.amqp_url)
+        async with self.connection:
+            self.channel = await self.connection.channel()
+            await self.channel.set_qos(prefetch_count=1)
+            exchange = self.channel.default_exchange
 
-            queue = await channel.declare_queue(
+            queue = await self.channel.declare_queue(
                 self.queue_name,
                 durable=True,
             )
@@ -52,17 +58,29 @@ class AMQPWorker:
 
                             # Find the appropriate callback
                             if message_type in self.callbacks:
-                                response = await self.callbacks[message_type](data)
-                                # Publish the response back to the reply queue
-                                await exchange.publish(
-                                    Message(
-                                        body=json.dumps(response).encode(),
-                                        correlation_id=message.correlation_id,
-                                    ),
-                                    routing_key=message.reply_to,
-                                )
+                                response = await self.callbacks[message_type](data, message.reply_to, message.correlation_id)
+                                if response is not None:
+                                    await exchange.publish(
+                                        Message(
+                                            body=json.dumps(response).encode(),
+                                            correlation_id=message.correlation_id,
+                                        ),
+                                        routing_key=message.reply_to,
+                                    )
                                 print(f"Processed message of type '{message_type}'")
+                                # TODO: Acknowledge that the message was processed
                             else:
                                 logging.warning(f"No callback registered for message type '{message_type}'")
                     except Exception:
                         logging.exception("Processing error for message %r", message)
+
+    async def send_message(self, payload, queue, correlation_id, action=None):
+        exchange = self.channel.default_exchange
+        await exchange.publish(
+            Message(
+                body=json.dumps(payload).encode(),
+                correlation_id=correlation_id,
+                type=action,
+            ),
+            routing_key=queue,
+        )

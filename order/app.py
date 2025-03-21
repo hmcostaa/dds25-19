@@ -198,5 +198,32 @@ async def create_order(data):
     return {"order_id": key}, 200
 
 
+# This is a simple template on how to use the worker to handle the checkout saga
+@worker.register
+async def checkout(data, reply_to, correlation_id):
+    # do not immediatly respond back to the gateway, but store the reply_to and correlation_id
+    # first do the whole saga procedure
+    saga_id = str(uuid.uuid4())
+    worker.send_message(payload="3 apples", queue="stock_queue", correlation_id=saga_id, action="subtract")
+
+    # then return nothing to prevent the worker from sending a response back to the gateway
+    return
+
+# ... put here all handlers for all types of saga messages
+
+# v This is the last step of the saga
+
+
+@worker.register
+async def payment_success(data):
+    reply_to = "some reply queue"  # obtained earlier from checkout callback
+    correlation_id = "some correlation id"  # obtained earlier from checkout callback
+    # now we can finally manually respond back to the gateway
+    worker.send_message(payload=("success", 200), queue=reply_to, correlation_id=correlation_id)
+
+    # no need to respond back to the payment service
+    return
+
+
 if __name__ == '__main__':
     asyncio.run(worker.start())
