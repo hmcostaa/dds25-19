@@ -93,6 +93,17 @@ async def create_item(price):
                                            payload={"price": price})
     return response, code
 
+@app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
+async def batch_init(n,starting_stock,item_price):
+    payload = {
+        "n": n,
+        "starting_stock" : starting_stock,
+        "item_price" : item_price
+    }
+    response, code = await rpc_client.call(queue="stock_queue",
+                                           action="batch_init_stock",
+                                           payload=payload)
+    return response, code
 
 ######## Payment Service Routes ########
 

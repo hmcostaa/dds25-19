@@ -100,11 +100,11 @@ async def create_item(data):
     price = data.get("price")
     key = str(uuid.uuid4())
     app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=10, price=int(price)))
+    value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
-        return DB_ERROR_STR, 400
+    except redis.exceptions.RedisError as re:
+        return str(re), 400
     except Exception as e:
         # Catch any other unexpected exceptions to prevent silent failures
         return f"Unexpected error: {str(e)}", 401
@@ -113,22 +113,21 @@ async def create_item(data):
 
 
 @worker.register
-async def batch_init_users(data):
+async def batch_init_stock(data):
     n = int(data.get("n"))
     starting_stock = int(data.get("starting_stock"))
     item_price = int(data.get("item_price"))
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+    kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return DB_ERROR_STR, 400
+    except redis.exceptions.RedisError as re:
+        return str(re), 400
     except Exception as e:
         # Catch any other unexpected exceptions to prevent silent failures
         return f"Unexpected error: {str(e)}", 401
 
-
-    return {'msg': "Batch init for stock successful"}, 200
+    return {'msg': f"{kv_pairs.keys()}"}, 200
 
 
 @worker.register
@@ -158,7 +157,7 @@ async def add_stock(data):
     if response_code != 200:
         return updated_item, 402
 
-    return {"Added": True, 
+    return {
             "UpdatedStock": updated_item.stock
             }, 200
 
