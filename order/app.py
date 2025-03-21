@@ -7,6 +7,7 @@ from collections import defaultdict
 import asyncio
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
+import time
 
 import redis
 import requests
@@ -310,6 +311,44 @@ async def add_item(data):
         return abort(400, DB_ERROR_STR)
 
     return {"msg": f"Item: {item_id} added to order: {order_id}, total cost updated to: {order_entry.total_cost}"}
+
+
+# Helper methods locks
+def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
+    """
+    Acquire a write lock on an order to prevent multiple writes.
+    :param order_id: The ID of the order to lock.
+    :param lock_timeout: The lock timeout in milliseconds (default: 10 seconds).
+    :return: True if the lock was acquired, False otherwise.
+    """
+    lock_key = f"write_lock:order:{order_id}"
+    lock_value = str(uuid.uuid4())  # Unique value to identify the lock owner
+
+    # Try to acquire the lock using Redis SET with NX and PX options
+    is_locked = db.set(lock_key, lock_value, nx=True, px=lock_timeout)
+
+    return lock_value if is_locked else None  # Returns the lock value if acquired, False otherwise
+
+def release_write_lock(order_id: str, lock_value: str) -> bool:
+    """
+    Release the write lock for a specific order.
+    :param order_id: The ID of the order to unlock.
+    :param lock_value: The unique value of the lock owner.
+    :return: True if the lock was released, False otherwise.
+    """
+    lock_key = f"write_lock:order:{order_id}"
+
+    # Use a Lua script to ensure atomicity
+    lua_script = """
+    if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+    else
+        return 0
+    end
+    """
+    result = db.eval(lua_script, 1, lock_key, lock_value)
+
+    return result == 1  # Returns True if the lock was released, False otherwise
 
 
 if __name__ == '__main__':

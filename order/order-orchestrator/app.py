@@ -5,8 +5,14 @@ import logging
 import uuid
 import time
 
+# Import Order Service
+from order.app import find_order, acquire_write_lock, release_write_lock
+
 # RabbitMQ library
 from aio_pika import connect_robust, Message, DeliveryMode
+
+# RPC client for internal service calls
+from common.rpc_client import RpcClient
 
 # Redis library
 from redis import Redis
@@ -16,6 +22,9 @@ from aiohttp import web, ClientSession
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize RPC client
+rpc_client = RpcClient()
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -64,20 +73,27 @@ async def process_checkout_request(message):
         })
 
         # (Optional) fetch order details from your Order Service
-        async with ClientSession() as session:
-            # Example: this might be an HTTP GET to fetch details
-            # resp = await session.get(f"{ORDER_SERVICE_URL}/find/{order_id}")
-            # order_data = await resp.json()
-            # For demonstration, we’ll just simulate an order payload:
-            await asyncio.sleep(0.3)  # simulating network/processing
-            order_data = {
-                "order_id": order_id,
-                "user_id": "some_user",
-                "items": [("item1", 2), ("item2", 1)],
-                "total_cost": 999
-            }
+        # async with ClientSession() as session:
+        #     # Example: this might be an HTTP GET to fetch details
+        #     # resp = await session.get(f"{ORDER_SERVICE_URL}/find/{order_id}")
+        #     # order_data = await resp.json()
+        #     # For demonstration, we’ll just simulate an order payload:
+        #     await asyncio.sleep(0.3)  # simulating network/processing
+        #     order_data = {
+        #         "order_id": order_id,
+        #         "user_id": "some_user",
+        #         "items": [("item1", 2), ("item2", 1)],
+        #         "total_cost": 999
+        #     }
 
-        update_saga_state(saga_id, "ORDER_DETAILS_FETCHED", order_data)
+        order_data = await find_order(order_id)
+        
+        # Lock order to prevent concurrent processing
+        order_lock_value = acquire_write_lock(order_id)
+        if order_lock_value is None:
+            raise Exception("Order is already being processed")
+        logger.info(f"[Order Orchestrator] Lock acquired {order_lock_value} for order {order_id}")
+        update_saga_state(saga_id, "ORDER_LOCKED", order_data)
 
         # Step 1: Publish "stock.reserve" so the Stock Service can reserve items
         logger.info(f"[Order Orchestrator] Sending stock.reserve for saga={saga_id}, order={order_id}")
@@ -86,6 +102,12 @@ async def process_checkout_request(message):
             "order_id": order_id,
             "items": order_data["items"]
         })
+
+        # TODO: Pay for the order if stock reservation is successful
+
+        # TODO: Subtract stock from inventory if payment is successful
+
+        # TODO: Release the order lock after the saga completes
 
     except Exception as e:
         logger.error(f"Error in process_checkout_request: {str(e)}")
@@ -291,7 +313,7 @@ def update_saga_state(saga_id, status, details=None):
             # Create a new saga record if not found
             saga_data = {
                 "saga_id": saga_id,
-                "status": "STARTED",
+                "status": status,
                 "steps": [],
                 "created_at": time.time()
             }
@@ -315,7 +337,7 @@ def update_saga_state(saga_id, status, details=None):
         logger.error(f"Error updating saga state: {str(e)}")
 
 def get_saga_state(saga_id):
-    """Retrieve the saga’s current state from Redis."""
+    """Retrieve the saga's current state from Redis."""
     try:
         saga_key = f"saga:{saga_id}"
         saga_json = saga_redis.get(saga_key)
