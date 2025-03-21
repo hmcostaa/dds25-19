@@ -1,6 +1,15 @@
 import os
 from quart import Quart
 from rpc_client import RpcClient
+import logging
+
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s: %(message)s"
+)
+
 
 app = Quart(__name__)
 rpc_client = RpcClient()
@@ -22,11 +31,17 @@ async def create_order(user_id):
     return response, code
 
 
-@app.route("/orders/find/<order_id>", methods=["GET"])
-async def find_order(order_id):
-    response, code = await rpc_client.call(queue="order_queue",
-                                           action="find_order",
-                                           payload={"order_id": order_id})
+@app.route("/payment/find_user/<user_id>", methods=["GET"])
+async def find_user(user_id):
+    logging.info("Gateway received find_user request for user_id: %s", user_id)
+    payload = {"user_id": user_id}
+    logging.debug("Sending payload to RPC client: %s", payload)
+    response, code = await rpc_client.call(
+        queue="payment_queue",
+        action="find_user",
+        payload=payload
+    )
+    logging.info("Gateway received response: %s with code %s", response, code)
     return response, code
 
 
@@ -128,12 +143,6 @@ async def create_user():
     return response, code
 
 
-@app.route("/payment/find_user/<user_id>", methods=["GET"])
-async def find_user(user_id):
-    response, code = await rpc_client.call(queue="payment_queue",
-                                           action="find_user",
-                                           payload={"user_id": user_id})
-    return response, code
 
 if __name__ == "__main__":
     app.run()
