@@ -6,13 +6,15 @@ import uuid
 import time
 
 # Import Order Service
-from order.app import find_order, acquire_write_lock, release_write_lock
+from order.app import find_order, acquire_write_lock, release_write_lock, db_master, OrderValue
 
 # RabbitMQ library
 from aio_pika import connect_robust, Message, DeliveryMode
 
 # RPC client for internal service calls
 from common.rpc_client import RpcClient
+
+from common.amqp_worker import AMQPWorker
 
 # Redis library
 from redis import Redis
@@ -50,6 +52,11 @@ saga_redis = Redis(
 # Generate a unique ID for this orchestrator instance
 ORCHESTRATOR_ID = str(uuid.uuid4())
 
+worker = AMQPWorker(
+    amqp_url=os.environ["AMQP_URL"],
+    queue_name="order_queue",
+)
+
 # ----------------------------------------------------------------------------
 # 1. Process an order checkout request (starting point of the saga)
 # ----------------------------------------------------------------------------
@@ -72,36 +79,19 @@ async def process_checkout_request(message):
             "initiated_at": time.time()
         })
 
-        # (Optional) fetch order details from your Order Service
-        # async with ClientSession() as session:
-        #     # Example: this might be an HTTP GET to fetch details
-        #     # resp = await session.get(f"{ORDER_SERVICE_URL}/find/{order_id}")
-        #     # order_data = await resp.json()
-        #     # For demonstration, we’ll just simulate an order payload:
-        #     await asyncio.sleep(0.3)  # simulating network/processing
-        #     order_data = {
-        #         "order_id": order_id,
-        #         "user_id": "some_user",
-        #         "items": [("item1", 2), ("item2", 1)],
-        #         "total_cost": 999
-        #     }
-
         order_data = await find_order(order_id)
         
         # Lock order to prevent concurrent processing
         order_lock_value = acquire_write_lock(order_id)
+        update_saga_state(saga_id, "ORDER_LOCK_REQUESTED", order_data)
         if order_lock_value is None:
             raise Exception("Order is already being processed")
         logger.info(f"[Order Orchestrator] Lock acquired {order_lock_value} for order {order_id}")
         update_saga_state(saga_id, "ORDER_LOCKED", order_data)
 
-        # Step 1: Publish "stock.reserve" so the Stock Service can reserve items
-        logger.info(f"[Order Orchestrator] Sending stock.reserve for saga={saga_id}, order={order_id}")
-        await publish_event("stock.reserve", {
-            "saga_id": saga_id,
-            "order_id": order_id,
-            "items": order_data["items"]
-        })
+        # Step 1: Publish stock reserve so the Stock Service can reserve items
+        logger.info(f"[Order Orchestrator] Sending substract stock message to  for saga={saga_id}, order={order_id}")
+        worker.send_message(payload=order_data["items"], queue="stock_queue", correlation_id=saga_id, action="reserve")
 
         # TODO: Pay for the order if stock reservation is successful
 
