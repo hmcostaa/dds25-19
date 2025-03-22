@@ -60,7 +60,8 @@ worker = AMQPWorker(
 # ----------------------------------------------------------------------------
 # 1. Process an order checkout request (starting point of the saga)
 # ----------------------------------------------------------------------------
-async def process_checkout_request(message):
+@worker.register
+async def process_checkout_request(data):
     """
     Receives 'order.checkout' events to begin the saga.
     Tries to reserve stock first, then waits for success/failure events.
@@ -101,10 +102,6 @@ async def process_checkout_request(message):
             }
             worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="reserve")
 
-        # TODO: Subtract stock from inventory if payment is successful
-
-        # TODO: Release the order lock after the saga completes
-
     except Exception as e:
         logger.error(f"Error in process_checkout_request: {str(e)}")
         if 'saga_id' in locals():
@@ -117,13 +114,12 @@ async def process_checkout_request(message):
                 "status": "failed",
                 "error": str(e)
             })
-    finally:
-        await message.ack()
 
 # ----------------------------------------------------------------------------
 # 2. Handle stock reservation completion
 # ----------------------------------------------------------------------------
-async def process_stock_completed(message):
+@worker.register
+async def process_stock_completed(data):
     """
     Receives 'stock.reservation_completed' event after Stock Service reserves items.
     Then we proceed to request payment.
@@ -173,21 +169,19 @@ async def process_stock_completed(message):
                 "status": "failed",
                 "error": str(e)
             })
-    finally:
-        await message.ack()
 
 # ----------------------------------------------------------------------------
 # 3. Handle payment completion
 # ----------------------------------------------------------------------------
-async def process_payment_completed(message):
+@worker.register
+async def process_payment_completed(data):
     """
     Receives 'payment.completed' after the Payment Service finishes charging.
     Then the order can be finalized.
     """
     try:
-        body = json.loads(message.body.decode())
-        saga_id = body.get('saga_id')
-        order_id = body.get('order_id')
+        saga_id = data.get("saga_id")
+        order_id = data.get("order_id")
 
         logger.info(f"[Order Orchestrator] Payment completed for saga={saga_id}, order={order_id}")
         update_saga_state(saga_id, "PAYMENT_COMPLETED")
@@ -250,24 +244,22 @@ async def process_payment_completed(message):
                 "status": "failed",
                 "error": str(e)
             })
-    finally:
-        await message.ack()
 
 # ----------------------------------------------------------------------------
 # 4. Handle generic failure events
 #    (e.g., if Stock or Payment explicitly publish "reservation_failed" or "payment.failed")
 # ----------------------------------------------------------------------------
-async def process_failure_events(message):
+async def process_failure_events(data):
     """
     Any service can publish a failure event: e.g. 'stock.reservation_failed' or 'payment.failed'.
     The orchestrator listens, updates the saga state, and triggers compensation if needed.
     """
     try:
-        body = json.loads(message.body.decode())
-        saga_id = body.get('saga_id')
-        order_id = body.get('order_id')
-        error = body.get('error', 'Unknown error')
-        routing_key = message.routing_key
+        saga_id = data.get("saga_id")
+        order_id = data.get("order_id")
+        # TODO: Extract error message from the event
+        error = data.get('error', 'Unknown error')
+        routing_key = data.routing_key
 
         logger.info(f"[Order Orchestrator] Failure event {routing_key} for saga={saga_id}: {error}")
         update_saga_state(saga_id, f"FAILURE_EVENT_{routing_key.upper()}", {"error": error})
@@ -275,7 +267,7 @@ async def process_failure_events(message):
         saga_data = get_saga_state(saga_id)
         if not saga_data:
             logger.error(f"[Order Orchestrator] Saga {saga_id} not found.")
-            await message.ack()
+            # await message.ack()
             return
 
         # Check which steps were completed
@@ -310,8 +302,6 @@ async def process_failure_events(message):
 
     except Exception as e:
         logger.error(f"Error in process_failure_events: {str(e)}")
-    finally:
-        await message.ack()
 
 # ----------------------------------------------------------------------------
 # Saga State Helpers
