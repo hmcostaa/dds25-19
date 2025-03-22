@@ -314,7 +314,7 @@ def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
     # Try to acquire the lock using Redis SET with NX and PX options
     is_locked = db.set(lock_key, lock_value, nx=True, px=lock_timeout)
 
-    return lock_value if is_locked else None  # Returns the lock value if acquired, False otherwise
+    return lock_value if is_locked else None  # Returns the lock value if acquired, None otherwise
 
 def release_write_lock(order_id: str, lock_value: str) -> bool:
     """

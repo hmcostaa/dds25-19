@@ -74,13 +74,15 @@ class AMQPWorker:
                     except Exception:
                         logging.exception("Processing error for message %r", message)
 
-    async def send_message(self, payload, queue, correlation_id, action=None):
+    async def send_message(self, payload, queue, correlation_id, reply_to, action=None, callback_action=None):
         exchange = self.channel.default_exchange
         await exchange.publish(
             Message(
                 body=json.dumps(payload).encode(),
                 correlation_id=correlation_id,
                 type=action,
+                reply_to=reply_to,
+                callback_to=callback_action
             ),
             routing_key=queue,
         )

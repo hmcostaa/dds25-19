@@ -67,8 +67,7 @@ async def process_checkout_request(data):
     Tries to reserve stock first, then waits for success/failure events.
     """
     try:
-        body = json.loads(message.body.decode())
-        order_id = body.get('order_id')
+        order_id = data.get('order_id')
         logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}")
 
         # Create a new Saga ID for this checkout
@@ -100,7 +99,10 @@ async def process_checkout_request(data):
                 "item_id": item_id,
                 "quantity": quantity
             }
-            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="reserve")
+            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, 
+                                action="reserve", reply_to="orchestrator_queue", callback_action="process_stock_completed")
+
+        return
 
     except Exception as e:
         logger.error(f"Error in process_checkout_request: {str(e)}")
@@ -125,9 +127,8 @@ async def process_stock_completed(data):
     Then we proceed to request payment.
     """
     try:
-        body = json.loads(message.body.decode())
-        saga_id = body.get('saga_id')
-        order_id = body.get('order_id')
+        saga_id = data.get('saga_id')
+        order_id = data.get('order_id')
 
         logger.info(f"[Order Orchestrator] Stock reservation completed for saga={saga_id}, order={order_id}")
         update_saga_state(saga_id, "STOCK_RESERVATION_COMPLETED")
@@ -151,7 +152,10 @@ async def process_stock_completed(data):
             "amount": total_cost
         }
         update_saga_state(saga_id, "PAYMENT_INITIATED")
-        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id, action="remove_credit")
+        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id, 
+                            action="remove_credit", reply_to="orchestrator_queue", callback_action="process_payment_completed")
+
+        return
 
     except Exception as e:
         logger.error(f"Error in process_stock_completed: {str(e)}")
@@ -218,11 +222,15 @@ async def process_payment_completed(data):
         update_saga_state(saga_id, "SAGA_COMPLETED", {"completed_at": time.time()})
 
         # Notify success
-        worker.send_message(payload={
+        payload = {
             "saga_id": saga_id,
             "order_id": order_id,
             "status": "success"
-        }, queue="order_queue", correlation_id=saga_id, action="checkout_completed")
+        }
+        worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id, 
+                            action="checkout_completed", reply_to="gateway_queue")
+
+        return
 
     except Exception as e:
         logger.error(f"Error in process_payment_completed: {str(e)}")
