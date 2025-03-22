@@ -211,19 +211,6 @@ async def find_order(data):
     }
 
 
-@worker.register
-async def find_order(data):
-    order_id = data.get("order_id")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    return {
-        "order_id": order_id,
-        "paid": order_entry.paid,
-        "items": order_entry.items,
-        "user_id": order_entry.user_id,
-        "total_cost": order_entry.total_cost
-    }
-
-
 def send_post_request(url: str):
     try:
         response = requests.post(url)

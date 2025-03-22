@@ -87,13 +87,19 @@ async def process_checkout_request(message):
         if order_lock_value is None:
             raise Exception("Order is already being processed")
         logger.info(f"[Order Orchestrator] Lock acquired {order_lock_value} for order {order_id}")
-        update_saga_state(saga_id, "ORDER_LOCKED", order_data)
+        update_saga_state(saga_id, "ORDER_LOCKED", {
+            "order_id": order_id,
+            "lock_value": order_lock_value
+        })
 
         # Step 1: Publish stock reserve so the Stock Service can reserve items
-        logger.info(f"[Order Orchestrator] Sending substract stock message to  for saga={saga_id}, order={order_id}")
-        worker.send_message(payload=order_data["items"], queue="stock_queue", correlation_id=saga_id, action="reserve")
-
-        # TODO: Pay for the order if stock reservation is successful
+        logger.info(f"[Order Orchestrator] Sending reserve stock message for saga={saga_id}, order={order_id}")
+        for item_id, quantity in order_data["items"]:
+            payload = {
+                "item_id": item_id,
+                "quantity": quantity
+            }
+            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="reserve")
 
         # TODO: Subtract stock from inventory if payment is successful
 
@@ -143,13 +149,13 @@ async def process_stock_completed(message):
             raise Exception("Missing user_id or total_cost in saga details")
 
         # Step 2: Publish "payment.request" for Payment Service
-        logger.info(f"[Order Orchestrator] Sending payment.request for saga={saga_id}, order={order_id}")
-        await publish_event("payment.request", {
-            "saga_id": saga_id,
-            "order_id": order_id,
+        logger.info(f"[Order Orchestrator] Sending remove_credit request for saga={saga_id}, order={order_id}")
+        payload = {
             "user_id": user_id,
             "amount": total_cost
-        })
+        }
+        update_saga_state(saga_id, "PAYMENT_INITIATED")
+        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id, action="remove_credit")
 
     except Exception as e:
         logger.error(f"Error in process_stock_completed: {str(e)}")
@@ -186,22 +192,43 @@ async def process_payment_completed(message):
         logger.info(f"[Order Orchestrator] Payment completed for saga={saga_id}, order={order_id}")
         update_saga_state(saga_id, "PAYMENT_COMPLETED")
 
-        # Step 3: Finalize the order in your Order Service
-        async with ClientSession() as session:
-            # e.g. finalize call to your order service
-            # resp = await session.post(f"{ORDER_SERVICE_URL}/finalize/{order_id}")
-            # ...
-            await asyncio.sleep(0.3)  # simulating an HTTP call
+        # Step 3: Finalize the order in your Order Service by removing the previusly reserved items
+        worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="remove_stock")
+        order_data = await find_order(order_id)
+        for item_id, quantity in order_data["items"]:
+            payload = {
+                "item_id": item_id,
+                "quantity": quantity
+            }
+            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="remove_stock")
+        logger.info(f"[Order Orchestrator] Stock removed successfully for saga={saga_id}, order={order_id}")
+        update_saga_state(saga_id, "STOCK_REMOVED")
+
+        # Retrieve saga state to get user_id, total_cost, etc.
+        saga_data = get_saga_state(saga_id)
+        if not saga_data:
+            raise Exception(f"Saga {saga_id} not found")
+        
+        # Get the lock_value from the saga state
+        lock_value = saga_data["details"].get("lock_value")
+        if not lock_value:
+            raise Exception(f"Lock value not found for saga {saga_id}")
+
+        # Release the order lock
+        if release_write_lock(order_id, lock_value):
+            update_saga_state(saga_id, "ORDER_LOCK_RELEASED")
+        else:
+            raise Exception(f"Failed to release lock for order {order_id}")
 
         update_saga_state(saga_id, "ORDER_FINALIZED")
         update_saga_state(saga_id, "SAGA_COMPLETED", {"completed_at": time.time()})
 
         # Notify success
-        await publish_event("order.checkout_completed", {
+        worker.send_message(payload={
             "saga_id": saga_id,
             "order_id": order_id,
             "status": "success"
-        })
+        }, queue="order_queue", correlation_id=saga_id, action="checkout_completed")
 
     except Exception as e:
         logger.error(f"Error in process_payment_completed: {str(e)}")
