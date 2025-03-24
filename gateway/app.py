@@ -88,39 +88,6 @@ async def add_stock(item_id, amount):
 # The following routes are used to interact with the payment service
 @app.route("/payment/create_user")
 async def create_user():
-    payload = {
-        "type": "create_user",
-        "data": {}
-    }
-    response = await rpc_client.call(payload, "payment_queue")
-    return response
-
-@app.route("/stock/create_item/<price>")
-async def create_item(price):
-    payload = {
-        "type": "create_item",
-        "data": {
-            "price": price
-        }
-    }
-    response = await rpc_client.call(payload, "stock_queue")
-    return response
-
-@app.route("/payment/find_user/<user_id>")
-async def find_user(user_id):
-    payload = {
-        "type": "find_user",
-        "data": {
-            "user_id": user_id
-        }
-    }
-    response = await rpc_client.call(payload, "payment_queue")
-    return response
-
-# The following routes are used to interact with the payment service
-@app.route("/payment/create_user")
->>>>>>> Stashed changes
-async def create_user():
     response, code = await rpc_client.call(queue="payment_queue",
                                            action="create_user")
     return response, code

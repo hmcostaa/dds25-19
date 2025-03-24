@@ -7,15 +7,13 @@ from collections import defaultdict
 import asyncio
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
-import time
+from redis import Sentinel
 
 import redis
 import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-
-from stock.app import db_master
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -24,14 +22,17 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+sentinel= Sentinel([
+    (os.environ['REDIS_SENTINEL_1'],26379),
+    (os.environ['REDIS_SENTINEL_2'],26380),
+    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
+db_master=sentinel.master_for('order-master', socket_timeout=0.1, decoder_responses=True)
+db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decoder_responses=True)
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
 
 
 atexit.register(close_db_connection)
@@ -47,7 +48,7 @@ class OrderValue(Struct):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(order_id)
+        entry: bytes = db_slave.get(order_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -78,7 +79,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        db_master.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
@@ -179,7 +180,6 @@ worker = AMQPWorker(
 rpc_client = RpcClient()
 
 
-@worker.before_start
 async def connect_rpc_client():
     # Connect the RpcClient to the AMQP server
     await rpc_client.connect(os.environ["AMQP_URL"])
@@ -187,7 +187,6 @@ async def connect_rpc_client():
 
 @worker.register
 async def create_order(data):
-    user_id = data.get("user_id")
     key = str(uuid.uuid4())
     user_id = data.get("user_id")
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
@@ -262,7 +261,6 @@ def checkout(order_id: str):
 
 @worker.register
 async def add_item(data):
-    # order_id: str, item_id: str, quantity: int
     order_id = data.get("order_id")
     item_id = data.get("item_id")
     quantity = data.get("quantity")
@@ -312,7 +310,7 @@ def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
     lock_value = str(uuid.uuid4())  # Unique value to identify the lock owner
 
     # Try to acquire the lock using Redis SET with NX and PX options
-    is_locked = db.set(lock_key, lock_value, nx=True, px=lock_timeout)
+    is_locked = db_master.set(lock_key, lock_value, nx=True, px=lock_timeout)
 
     return lock_value if is_locked else None  # Returns the lock value if acquired, None otherwise
 
@@ -333,10 +331,11 @@ def release_write_lock(order_id: str, lock_value: str) -> bool:
         return 0
     end
     """
-    result = db.eval(lua_script, 1, lock_key, lock_value)
+    result = db_master.eval(lua_script, 1, lock_key, lock_value)
 
     return result == 1  # Returns True if the lock was released, False otherwise
 
 
 if __name__ == '__main__':
+    asyncio.run(connect_rpc_client())
     asyncio.run(worker.start())

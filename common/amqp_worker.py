@@ -58,6 +58,7 @@ class AMQPWorker:
 
                             # Find the appropriate callback
                             if message_type in self.callbacks:
+                                # TODO: callback_action in the callback function call
                                 response = await self.callbacks[message_type](data, message.reply_to, message.correlation_id)
                                 if response is not None:
                                     await exchange.publish(

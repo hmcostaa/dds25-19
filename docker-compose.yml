@@ -333,6 +333,8 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    volumes:
+      - ./common:/usr/src/app/stock/common
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
