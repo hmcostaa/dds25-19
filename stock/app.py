@@ -20,8 +20,8 @@ sentinel= Sentinel([
     (os.environ['REDIS_SENTINEL_2'],26380),
     (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-db_master=sentinel.master_for('order-master', socket_timeout=0.1, decoder_responses=True)
-db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decoder_responses=True)
+db_master=sentinel.master_for('order-master', socket_timeout=0.1, decode_responses=True)
+db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decode_responses=True)
 
 def close_db_connection():
     db_master.close()

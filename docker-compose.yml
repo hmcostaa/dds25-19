@@ -302,13 +302,12 @@ services:
     volumes:
       - ./common:/usr/src/app/order/common
     environment:
-      - AMQP_URL= "amqp://user:password@rabbitmq:5672/"
-      - GATEWAY_URL=http://gateway:5000
-      - SAGA_REDIS_HOST=redis-saga-master
-      - SAGA_REDIS_PORT=6379
-      - SAGA_REDIS_PASSWORD=redis
-      - SAGA_REDIS_DB=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+      SAGA_REDIS_HOST: redis-saga-master
+      SAGA_REDIS_PORT: 6379
+      SAGA_REDIS_PASSWORD: redis
+      SAGA_REDIS_DB: 1
+    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     networks:
@@ -335,7 +334,7 @@ services:
     image: stock:latest
     volumes:
       - ./common:/usr/src/app/stock/common
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
       SAGA_REDIS_HOST: redis-saga-master

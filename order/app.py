@@ -18,8 +18,6 @@ from flask import Flask, jsonify, abort, Response
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
-GATEWAY_URL = os.environ['GATEWAY_URL']
-
 app = Flask("order-service")
 
 sentinel= Sentinel([
@@ -27,8 +25,8 @@ sentinel= Sentinel([
     (os.environ['REDIS_SENTINEL_2'],26380),
     (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-db_master=sentinel.master_for('order-master', socket_timeout=0.1, decoder_responses=True)
-db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decoder_responses=True)
+db_master=sentinel.master_for('order-master', socket_timeout=0.1, decode_responses=True)
+db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decode_responses=True)
 
 def close_db_connection():
     db_master.close()
@@ -218,45 +216,45 @@ def send_post_request(url: str):
     else:
         return response
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+# def rollback_stock(removed_items: list[tuple[str, int]]):
+#     for item_id, quantity in removed_items:
+#         send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
-@app.post('/checkout/<order_id>')
-def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    pipe = db_master.pipeline()
-    try:
-        pipe.watch(order_id)
-        pipe.multi()
-        for item_id, quantity in items_quantities.items():
-            stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-            if stock_reply.status_code != 200:
-                # If one item does not have enough stock we need to rollback
-                rollback_stock(removed_items)
-                abort(400, f'Out of stock on item_id: {item_id}')
-            removed_items.append((item_id, quantity))
-        payment_response = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-        if payment_response.status_code != 200:
-          rollback_stock(removed_items)
-          pipe.reset()
-          abort(400, "Payment failed or user out of credit")
-        order_entry.paid = True
-        pipe.set(order_id, msgpack.encode(order_entry))
-        pipe.execute()
-    except redis.WatchError:
-        abort(400, DB_ERROR_STR)
-        app.logger.debug("Checkout successful")
-    return jsonify({"msg": "Checkout successful"})
+# @app.post('/checkout/<order_id>')
+# def checkout(order_id: str):
+#     app.logger.debug(f"Checking out {order_id}")
+#     order_entry: OrderValue = get_order_from_db(order_id)
+#     # get the quantity per item
+#     items_quantities: dict[str, int] = defaultdict(int)
+#     for item_id, quantity in order_entry.items:
+#         items_quantities[item_id] += quantity
+#     # The removed items will contain the items that we already have successfully subtracted stock from
+#     # for rollback purposes.
+#     removed_items: list[tuple[str, int]] = []
+#     pipe = db_master.pipeline()
+#     try:
+#         pipe.watch(order_id)
+#         pipe.multi()
+#         for item_id, quantity in items_quantities.items():
+#             stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
+#             if stock_reply.status_code != 200:
+#                 # If one item does not have enough stock we need to rollback
+#                 rollback_stock(removed_items)
+#                 abort(400, f'Out of stock on item_id: {item_id}')
+#             removed_items.append((item_id, quantity))
+#         payment_response = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
+#         if payment_response.status_code != 200:
+#           rollback_stock(removed_items)
+#           pipe.reset()
+#           abort(400, "Payment failed or user out of credit")
+#         order_entry.paid = True
+#         pipe.set(order_id, msgpack.encode(order_entry))
+#         pipe.execute()
+#     except redis.WatchError:
+#         abort(400, DB_ERROR_STR)
+#         app.logger.debug("Checkout successful")
+#     return jsonify({"msg": "Checkout successful"})
 
 
 @worker.register

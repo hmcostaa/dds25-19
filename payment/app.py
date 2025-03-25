@@ -22,8 +22,8 @@ sentinel= Sentinel([
     (os.environ['REDIS_SENTINEL_2'],26380),
     (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-db_master=sentinel.master_for('payment-master', socket_timeout=0.1, decoder_responses=True)
-db_slave=sentinel.slave_for('payment-master', socket_timeout=0.1, decoder_responses=True)
+db_master=sentinel.master_for('payment-master', socket_timeout=0.1, decode_responses=True)
+db_slave=sentinel.slave_for('payment-master', socket_timeout=0.1, decode_responses=True)
 
 def close_db_connection():
     db_master.close()
@@ -39,7 +39,7 @@ class UserValue(Struct):
 def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(user_id)
+        entry: bytes = db_slave.get(user_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -68,7 +68,7 @@ def batch_init_users(n: int, starting_money: int):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        db_master.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
@@ -91,7 +91,7 @@ def add_credit(user_id: str, amount: int):
     # update credit, serialize and update database
     user_entry.credit += int(amount)
     try:
-        db.set(user_id, msgpack.encode(user_entry))
+        db_master.set(user_id, msgpack.encode(user_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
@@ -106,7 +106,7 @@ def remove_credit(user_id: str, amount: int):
     if user_entry.credit < 0:
         abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
-        db.set(user_id, msgpack.encode(user_entry))
+        db_master.set(user_id, msgpack.encode(user_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)

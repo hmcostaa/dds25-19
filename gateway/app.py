@@ -22,7 +22,7 @@ async def create_order(user_id):
             "user_id": user_id
         }
     }
-    response = await rpc_client.call(payload, "order_queue")
+    response = await rpc_client.call("order_queue", "create_order", payload)
     return response
 
 @app.route("/order/find_order/<order_id>")

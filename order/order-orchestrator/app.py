@@ -100,7 +100,7 @@ async def process_checkout_request(data):
                 "quantity": quantity
             }
             worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, 
-                                action="reserve", reply_to="orchestrator_queue", callback_action="process_stock_completed")
+                                action="reserve_stock", reply_to="orchestrator_queue", callback_action="process_stock_completed")
 
         return
 

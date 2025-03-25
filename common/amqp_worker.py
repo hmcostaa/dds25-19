@@ -59,7 +59,10 @@ class AMQPWorker:
                             # Find the appropriate callback
                             if message_type in self.callbacks:
                                 # TODO: callback_action in the callback function call
-                                response = await self.callbacks[message_type](data, message.reply_to, message.correlation_id)
+                                if message.type == "reserve_stock" or message.type == "remove_credit" or message.type == "remove_stock":
+                                    response = await self.callbacks[message_type](data, message.reply_to, message.correlation_id)
+                                else:
+                                    response = await self.callbacks[message_type](data)
                                 if response is not None:
                                     await exchange.publish(
                                         Message(

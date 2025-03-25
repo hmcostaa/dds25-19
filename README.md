@@ -3,6 +3,9 @@
 Basic project structure with Python's Flask and Redis. 
 **You are free to use any web framework in any language and any database you like for this project.**
 
+### RabbitMQ Management Interface
+http://localhost:15672
+
 ### Project structure
 
 * `env`
