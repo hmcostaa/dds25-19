@@ -5,6 +5,13 @@ import random
 import uuid
 from collections import defaultdict
 import asyncio
+from logging import basicConfig
+import time
+from typing import Dict
+
+import logger
+from typing_extensions import Optional
+
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
 from redis import Sentinel
@@ -17,6 +24,12 @@ from flask import Flask, jsonify, abort, Response
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
+SAGA_STATE_TTL=864000*3
+LOCK_TIMEOUT=30000
+
+logger.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 app = Flask("order-service")
 
@@ -28,7 +41,11 @@ sentinel= Sentinel([
 db_master=sentinel.master_for('order-master', socket_timeout=0.1, decode_responses=True)
 db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decode_responses=True)
 
+#Service id for this service
+SERVICE_ID=str(uuid.uuid4())
+
 def close_db_connection():
+    logger.info("Closing DB connections")
     db_master.close()
     db_slave.close()
 
@@ -46,15 +63,19 @@ class OrderValue(Struct):
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = db_slave.get(order_id)
-    except redis.exceptions.RedisError:
+        entry= db_slave.get(order_id)
+        if not entry:
+            logger.warning(f"Order: {order_id} not found in the database")
+            return None
+        entry_bytes=entry.encode() if isinstance(entry, str) else entry
+        return msgpack.decode(entry_bytes, type=OrderValue)
+    except redis.exceptions.RedisError as e:
+        logger.error(f"Database Error while getting order: {order_id} from the database:{str(e)}")
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
-        # if order does not exist in the database; abort
-        abort(400, f"Order: {order_id} not found!")
-    return entry
+    except Exception as e:
+        logger.error(f"Error while getting order: {order_id} from the database:{str(e)}")
+        return abort(400, DB_ERROR_STR)
 
 
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
@@ -306,11 +327,27 @@ def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
     """
     lock_key = f"write_lock:order:{order_id}"
     lock_value = str(uuid.uuid4())  # Unique value to identify the lock owner
-
-    # Try to acquire the lock using Redis SET with NX and PX options
-    is_locked = db_master.set(lock_key, lock_value, nx=True, px=lock_timeout)
-
-    return lock_value if is_locked else None  # Returns the lock value if acquired, None otherwise
+    try:
+        # Try to acquire the lock using Redis SET with NX and PX options
+        is_locked = db_master.set(lock_key, lock_value, nx=True, px=lock_timeout)
+        if is_locked:
+            logger.info(f"Lock acquired for order: {order_id}")
+            db_master.hmset(
+                f"lock_meta:{lock_key}",
+                {
+                    "service_id": SERVICE_ID,
+                    "ttl": SAGA_STATE_TTL,
+                    "lock_timeout": lock_timeout,
+                    "lock_value": lock_value
+                }
+            )
+            return lock_value
+        else:
+            logger.info(f"Lock already acquired for order: {order_id}")
+            return None
+    except Exception as e:
+        logger.error(f"Error while acquiring lock for order: {order_id}: {str(e)}")
+        return None
 
 def release_write_lock(order_id: str, lock_value: str) -> bool:
     """
@@ -320,18 +357,57 @@ def release_write_lock(order_id: str, lock_value: str) -> bool:
     :return: True if the lock was released, False otherwise.
     """
     lock_key = f"write_lock:order:{order_id}"
+    meta_key = f"lock_meta:{lock_key}"
+    try:
 
-    # Use a Lua script to ensure atomicity
-    lua_script = """
-    if redis.call("GET", KEYS[1]) == ARGV[1] then
-        return redis.call("DEL", KEYS[1])
-    else
-        return 0
-    end
-    """
-    result = db_master.eval(lua_script, 1, lock_key, lock_value)
+       # Use a Lua script to ensure atomicity
+       lua_script = """
+        if redis.call("GET", KEYS[1]) == ARGV[1] then
+        redis.call("DEL", KEYS[1])
+        redis.call("DEL", KEYS[2])
+        return 1
+        else
+          return 0
+        end
+        """
+       result = db_master.eval(lua_script, 1, lock_key, lock_value)
+       if result == 1:
+           logger.info(f"Lock released for order: {order_id}")
+           return True
+       else:
+         logger.warning(f"Failed to release lock for order {order_id}-lock value mismatch")
+         return False# Returns True if the lock was released, False otherwise
+    except Exception as e:
+        logger.error(f"Error while releasing lock for order: {order_id}: {str(e)}")
+        return False
 
-    return result == 1  # Returns True if the lock was released, False otherwise
+#Forcibly release abandoned locks
+def force_release_locks(order_id: str)->bool:
+   lock_key=f"write_lock:order:{order_id}"
+   meta_key=f"lock_meta:{lock_key}"
+   try:
+       meta=db_master.hgetall(meta_key)
+       if meta:
+           acquired_at=float(meta.get("acquired_at",0))
+           timeout=int(meta.get("lock_timeout",LOCK_TIMEOUT))
+           if time.time()-(acquired_at+(timeout /1000)*2):
+               db_master.delete(lock_key)
+               db_master.delete(meta_key)
+               logger.warning(f"Force released lock for order: {order_id}")
+               return True
+       return False
+   except Exception as e:
+       logger.error(f"Error while releasing lock for order: {order_id}: {str(e)}")
+       return False
+
+#generates idempotent key based on operation type and order_id
+def generate_idempotent_key(operation_type:str,order_id:str)->str:
+        op_id=str(uuid.uuid4())
+        return f"idempotent: {operation_type}:{order_id}:{op_id}"
+def check_idempotent_key(idempotent_key:str)->Optional[Dict]:
+    return db_master.get(idempotent_key)
+
+
 
 
 if __name__ == '__main__':

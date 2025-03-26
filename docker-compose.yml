@@ -38,9 +38,9 @@ services:
   redis-sentinel-1:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-1
-    command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
+    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
     volumes:
-      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
     depends_on:
       - redis-order-master
       - redis-payment-master
@@ -59,9 +59,9 @@ services:
   redis-sentinel-2:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-2
-    command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
+    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
     volumes:
-      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
     ports:
       - "26380:26379"
     networks:
@@ -77,9 +77,9 @@ services:
   redis-sentinel-3:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-3
-    command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
+    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
     volumes:
-      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
     ports:
       - "26381:26379"
     networks:

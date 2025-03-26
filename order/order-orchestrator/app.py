@@ -4,6 +4,10 @@ import asyncio
 import logging
 import uuid
 import time
+import warnings
+
+# Ignore all warnings
+warnings.filterwarnings("ignore")
 
 # Import Order Service
 from order.app import find_order, acquire_write_lock, release_write_lock, db_master, OrderValue
@@ -57,6 +61,7 @@ worker = AMQPWorker(
     queue_name="order_queue",
 )
 
+
 # ----------------------------------------------------------------------------
 # 1. Process an order checkout request (starting point of the saga)
 # ----------------------------------------------------------------------------
@@ -80,7 +85,7 @@ async def process_checkout_request(data):
         })
 
         order_data = await find_order(order_id)
-        
+
         # Lock order to prevent concurrent processing
         order_lock_value = acquire_write_lock(order_id)
         update_saga_state(saga_id, "ORDER_LOCK_REQUESTED", order_data)
@@ -99,8 +104,9 @@ async def process_checkout_request(data):
                 "item_id": item_id,
                 "quantity": quantity
             }
-            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, 
-                                action="reserve_stock", reply_to="orchestrator_queue", callback_action="process_stock_completed")
+            worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id,
+                                action="reserve_stock", reply_to="orchestrator_queue",
+                                callback_action="process_stock_completed")
 
         return
 
@@ -116,6 +122,7 @@ async def process_checkout_request(data):
                 "status": "failed",
                 "error": str(e)
             })
+
 
 # ----------------------------------------------------------------------------
 # 2. Handle stock reservation completion
@@ -152,8 +159,9 @@ async def process_stock_completed(data):
             "amount": total_cost
         }
         update_saga_state(saga_id, "PAYMENT_INITIATED")
-        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id, 
-                            action="remove_credit", reply_to="orchestrator_queue", callback_action="process_payment_completed")
+        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
+                            action="remove_credit", reply_to="orchestrator_queue",
+                            callback_action="process_payment_completed")
 
         return
 
@@ -173,6 +181,7 @@ async def process_stock_completed(data):
                 "status": "failed",
                 "error": str(e)
             })
+
 
 # ----------------------------------------------------------------------------
 # 3. Handle payment completion
@@ -206,7 +215,7 @@ async def process_payment_completed(data):
         saga_data = get_saga_state(saga_id)
         if not saga_data:
             raise Exception(f"Saga {saga_id} not found")
-        
+
         # Get the lock_value from the saga state
         lock_value = saga_data["details"].get("lock_value")
         if not lock_value:
@@ -227,7 +236,7 @@ async def process_payment_completed(data):
             "order_id": order_id,
             "status": "success"
         }
-        worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id, 
+        worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id,
                             action="checkout_completed", reply_to="gateway_queue")
 
         return
@@ -252,6 +261,7 @@ async def process_payment_completed(data):
                 "status": "failed",
                 "error": str(e)
             })
+
 
 # ----------------------------------------------------------------------------
 # 4. Handle generic failure events
@@ -311,6 +321,7 @@ async def process_failure_events(data):
     except Exception as e:
         logger.error(f"Error in process_failure_events: {str(e)}")
 
+
 # ----------------------------------------------------------------------------
 # Saga State Helpers
 # ----------------------------------------------------------------------------
@@ -351,6 +362,7 @@ def update_saga_state(saga_id, status, details=None):
     except Exception as e:
         logger.error(f"Error updating saga state: {str(e)}")
 
+
 def get_saga_state(saga_id):
     """Retrieve the saga's current state from Redis."""
     try:
@@ -363,6 +375,7 @@ def get_saga_state(saga_id):
     except Exception as e:
         logger.error(f"Error getting saga state: {str(e)}")
         return None
+
 
 # ----------------------------------------------------------------------------
 # RabbitMQ Publisher
@@ -389,6 +402,7 @@ async def publish_event(routing_key, payload):
         await connection.close()
     except Exception as e:
         logger.error(f"Error publishing event: {str(e)}")
+
 
 # ----------------------------------------------------------------------------
 # Leadership (Optional) and Recovery
@@ -420,6 +434,7 @@ async def maintain_leadership():
         except Exception as e:
             logger.error(f"Leadership maintenance error: {str(e)}")
             await asyncio.sleep(5)
+
 
 async def recover_in_progress_sagas():
     """
@@ -470,6 +485,7 @@ async def recover_in_progress_sagas():
     except Exception as e:
         logger.error(f"Error recovering sagas: {str(e)}")
 
+
 # ----------------------------------------------------------------------------
 # RabbitMQ Consumer Setup
 # ----------------------------------------------------------------------------
@@ -513,6 +529,7 @@ async def consume_messages():
             logger.error(f"Error in consume_messages: {str(e)}")
             await asyncio.sleep(5)
 
+
 # ----------------------------------------------------------------------------
 # Optional Health Check
 # ----------------------------------------------------------------------------
@@ -520,6 +537,7 @@ async def health_check_server():
     """
     Runs a simple HTTP server on port 8000 to respond with 'OK' for readiness checks.
     """
+
     async def health_handler(request):
         return web.Response(text="OK")
 
@@ -531,6 +549,7 @@ async def health_check_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=8000)
     await site.start()
     logger.info("[Order Orchestrator] Health check server started on :8000")
+
 
 # ----------------------------------------------------------------------------
 # Main Entry Point
@@ -549,6 +568,7 @@ async def main():
 
     # Start consuming saga messages
     await consume_messages()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
