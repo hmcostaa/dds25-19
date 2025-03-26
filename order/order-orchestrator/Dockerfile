@@ -1,13 +1,14 @@
 FROM python:3.12-slim
 
-WORKDIR /home/flask-app
+WORKDIR /usr/src/app/order-orchestrator
 
 COPY ./requirements.txt .
 
 RUN pip install -r requirements.txt
 
-COPY . .
+# Copy the order directory into the container
+COPY ../order /usr/src/app/order
 
-EXPOSE 5000
+COPY *.py .
 
 CMD ["python", "app.py"]

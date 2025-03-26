@@ -40,7 +40,8 @@ services:
     container_name: redis-sentinel-1
     command: ["redis-sentinel", "/etc/redis/sentinel.conf"]
     volumes:
-      - ./redis/sentinel.conf:/etc/redis/sentinel.conf
+      - ./sentinel.conf:/etc/redis/sentinel.conf
+      - ./redis-data:/redis
     depends_on:
       - redis-order-master
       - redis-payment-master
