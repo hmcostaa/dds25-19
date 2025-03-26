@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 # Initialize RPC client
 rpc_client = RpcClient()
 
+async def connect_rpc_client():
+    # Connect the RpcClient to the AMQP server
+    await rpc_client.connect(os.environ["AMQP_URL"])
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -84,10 +88,24 @@ async def process_checkout_request(data):
             "initiated_at": time.time()
         })
 
-        order_data = await find_order(order_id)
-
+        # order_data = await find_order(order_id)
+        # Prepare the payload for the stock service
+        order_data = await rpc_client.call({
+            "type": "find_order",
+            "data": {
+                "order_id": order_id
+                }
+            }, "order_queue")
+        
         # Lock order to prevent concurrent processing
-        order_lock_value = acquire_write_lock(order_id)
+        # order_lock_value = acquire_write_lock(order_id)
+        order_lock_value = await rpc_client.call({
+            "type": "acquire_write_lock",
+            "data": {
+                "order_id": order_id
+                }
+            }, "order_queue")
+
         update_saga_state(saga_id, "ORDER_LOCK_REQUESTED", order_data)
         if order_lock_value is None:
             raise Exception("Order is already being processed")
@@ -159,9 +177,9 @@ async def process_stock_completed(data):
             "amount": total_cost
         }
         update_saga_state(saga_id, "PAYMENT_INITIATED")
+        # TODO: Probably only the last message should have a callback_action???
         worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
-                            action="remove_credit", reply_to="orchestrator_queue",
-                            callback_action="process_payment_completed")
+                            action="remove_credit", reply_to="orchestrator_queue", callback_action="process_payment_completed")
 
         return
 
@@ -200,8 +218,13 @@ async def process_payment_completed(data):
         update_saga_state(saga_id, "PAYMENT_COMPLETED")
 
         # Step 3: Finalize the order in your Order Service by removing the previusly reserved items
-        worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="remove_stock")
-        order_data = await find_order(order_id)
+        # order_data = await find_order(order_id)
+        order_data = await rpc_client.call({
+            "type": "find_order",
+            "data": {
+                "order_id": order_id
+                }
+            }, "order_queue")
         for item_id, quantity in order_data["items"]:
             payload = {
                 "item_id": item_id,
@@ -222,7 +245,15 @@ async def process_payment_completed(data):
             raise Exception(f"Lock value not found for saga {saga_id}")
 
         # Release the order lock
-        if release_write_lock(order_id, lock_value):
+        # if release_write_lock(order_id, lock_value):
+        order_released = await rpc_client.call({
+            "type": "release_write_lock",
+            "data": {
+                "order_id": order_id,
+                "lock_value": lock_value
+                }
+            }, "order_queue")
+        if order_released:
             update_saga_state(saga_id, "ORDER_LOCK_RELEASED")
         else:
             raise Exception(f"Failed to release lock for order {order_id}")
@@ -571,4 +602,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(connect_rpc_client())
+    asyncio.run(worker.start())
