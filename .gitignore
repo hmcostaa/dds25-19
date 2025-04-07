@@ -3,3 +3,4 @@ __pycache__/
 order/orchestrator
 # Environments
 .venv/
+/venv
