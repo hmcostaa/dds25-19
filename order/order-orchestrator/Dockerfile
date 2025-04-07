@@ -7,8 +7,8 @@ COPY ./requirements.txt .
 RUN pip install -r requirements.txt
 
 # Copy the order directory into the container
-COPY ../order /usr/src/app/order
+COPY ./order /usr/src/app/order
 
-COPY *.py .
+COPY ./order/order-orchestrator/*.py ./
 
 CMD ["python", "app.py"]

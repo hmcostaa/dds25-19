@@ -9,9 +9,6 @@ from logging import basicConfig
 import time
 from typing import Dict
 
-import logger
-from typing_extensions import Optional
-
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
 from redis import Sentinel
@@ -22,12 +19,19 @@ import requests
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
+from global_idempotency import (
+    generate_idempotent_key,
+    check_idempotent_operation,
+    store_idempotent_result,
+    clear_idempotent_key_for_order,
+)
+
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 SAGA_STATE_TTL=864000*3
 LOCK_TIMEOUT=30000
 
-logger.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 

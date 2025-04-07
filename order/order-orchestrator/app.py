@@ -9,6 +9,9 @@ import warnings
 # Ignore all warnings
 warnings.filterwarnings("ignore")
 
+# Idempotency utils
+from global_idempotency.app import check_idempotency_key, store_idempotency_result, IdempotencyStoreConnectionError, IdempotencyDataError
+
 # Import Order Service
 from order.app import find_order, acquire_write_lock, release_write_lock, db_master, OrderValue
 
@@ -65,22 +68,31 @@ worker = AMQPWorker(
     queue_name="order_queue",
 )
 
+# states? maybe enum?
+# SAGA_STARTED
+# SAGA_COMPLETED
+# SAGA_FAILED
+
 
 # ----------------------------------------------------------------------------
 # 1. Process an order checkout request (starting point of the saga)
 # ----------------------------------------------------------------------------
 @worker.register
-async def process_checkout_request(data):
+async def process_checkout_request(data, message):
     """
     Receives 'order.checkout' events to begin the saga.
     Tries to reserve stock first, then waits for success/failure events.
     """
     try:
         order_id = data.get('order_id')
-        logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}")
+        saga_id = str(uuid.uuid4()) # Create a new Saga ID for this checkout uuid 4 for randomness
+        attempt_id = str(message.delivery_tag) if message else str(uuid.uuid4())
+        logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}, . Saga ID: {saga_id}")
 
-        # Create a new Saga ID for this checkout
-        saga_id = str(uuid.uuid4())
+        idempotency_key = f"idempotent:orchestrator:start_checkout:{order_id}:{attempt_id}"
+
+        existing_result = check_idempotent_key(idempotency_key)
+        
 
         # Initialize saga state
         update_saga_state(saga_id, "SAGA_STARTED", {
@@ -354,14 +366,38 @@ async def process_failure_events(data):
 
 
 # ----------------------------------------------------------------------------
+# Idempotency Helper
+# ----------------------------------------------------------------------------
+
+async def execute_idempotent_operation(key:str, message, handler_function, *args, **kwargs):
+    try:
+        stored_result = check_idempotency_key(key, idempotency_db_conn)
+        if stored_result:
+            logger.info(f"Idempotency hit for key {key}. Acking.")
+            await message.ack()
+            return
+    except Exception as e:
+        logger.error(f"Error checking idempotency key: {str(e)}")
+        await message.nack(requeue=True)
+        return
+
+    # if idompentcy check is successful, call the handler function
+    try:
+        await handler_function(message.correlation_id, message.type, message.body, *args, **kwargs)
+    except Exception:
+        logger.exception(f"Handler {handler_function.__name__} failed for key {key}")
+
+# ----------------------------------------------------------------------------
 # Saga State Helpers
 # ----------------------------------------------------------------------------
 def update_saga_state(saga_id, status, details=None):
     """
     Store/Update the saga state in Redis with the latest step.
     """
+     
+    saga_key = f"saga:{saga_id}"
     try:
-        saga_key = f"saga:{saga_id}"
+       
         saga_json = saga_redis.get(saga_key)
 
         if saga_json:
@@ -391,7 +427,7 @@ def update_saga_state(saga_id, status, details=None):
         saga_redis.set(saga_key, json.dumps(saga_data))
         logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
     except Exception as e:
-        logger.error(f"Error updating saga state: {str(e)}")
+        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
 
 
 def get_saga_state(saga_id):
