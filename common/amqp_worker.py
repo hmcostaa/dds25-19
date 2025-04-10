@@ -9,7 +9,7 @@ from aio_pika.abc import (
     AbstractIncomingMessage
 )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -69,55 +69,43 @@ class AMQPWorker:
         async with self.connection:
             self.channel = await self.connection.channel()
             await self.channel.set_qos(prefetch_count=1)
-            exchange = self.channel.default_exchange
+
+            dlx_name = f"{self.queue_name}.dlx"
+            dlq_name = f"{self.queue_name}.dlq"
+            dlq_routing_key = "dead_letter_queue"
+
+            await self.channel.declare_exchange(
+                dlx_name,
+                type="direct",
+                durable=True,
+            )
+
+            dead_letter_queue = await self.channel.declare_queue(
+                dlq_name,
+                durable=True,
+            )
+
+            logger.info(f"Declared DLX '{dlx_name}' and DLQ '{dlq_name}'")
+
+            main_queue_arguments = {
+                "x-dead-letter-exchange": dlx_name,
+                "x-dead-letter-routing-key": dlq_name
+            }
 
             queue = await self.channel.declare_queue(
                 self.queue_name,
                 durable=True,
-                #DLQ
-                # arguments={
-                #     "x-dead-letter-exchange": self.dlx_name,
-                #     "x-dead-letter-routing-key": self.dlq_name
-                # }
+                arguments=main_queue_arguments
             )
+
+            logger.info(f"Declared queue '{self.queue_name}' linked to DLX '{dlx_name}'")
+            
             #manual ack
             if self._use_manual_acks:
-                
                 await queue.consume(self.on_message, no_ack=False)
                 logger.info(" [*] Waiting for messages. To exit press CTRL+C")
-                # worker rusns indefinitely
                 await asyncio.Future()
 
-            #auto ack, previous implementation
-            # else:
-            #     async with queue.iterator() as qiterator:
-            #         message: AbstractIncomingMessage
-            #         async for message in qiterator:
-            #             async with message.process(requeue=False, ignore_processed=True):
-            #                 response = None # Define before try block
-            #                 try: 
-            #                     # Decode the message body
-            #                     data = json.loads(message.body.decode())
-            #                     message_type = message.type
-
-            #                     logger.debug(f" Received message type='{message_type}', "
-            #                              f"DeliveryTag={message.delivery_tag}, "
-            #                              f"CorrID='{message.correlation_id}'")
-                                
-            #                     # Find the appropriate callback
-            #                     if message_type in self.callbacks:
-            #                         handler = self.callbacks[message_type]
-            #                         logger.debug(f"[AutoACK] Calling handler '{handler.__name__}'")
-
-            #                         #call handler with (data, message), now message included for idempotency
-            #                         response = await handler(data, message)
-
-            #                         await self._handle_reply(message, response)
-            #                     else:
-            #                         logging.warning(f"No callback registered for message type '{message_type}'")
-            #                 except Exception:
-            #                     logging.exception("Processing error for message %r", message)
-            #                     raise
 
     async def on_message(self, message:AbstractIncomingMessage):
         """
@@ -152,9 +140,11 @@ class AMQPWorker:
         except json.JSONDecodeError:
             logger.exception("Error in message  inJSONDecodeError")
             try:
-                await message.nac(requeue=False)
+                await message.nack(requeue=False)
             except Exception as e:
                 logger.exception("Error nacking message JSONDECODE")
+            return
+        
         except Exception as e:
             logger.exception("Error in message processing loop DeliverTag=%s", message.delivery_tag)
 
@@ -178,13 +168,15 @@ class AMQPWorker:
                 #processing succceeded, but ack failed
                 #idempotency is important here
                 logger.exception("Error acking message, processing succceeded but ack failed, DeliverTag=%s", message.delivery_tag)
-        else:
-            #processing failed, weird case, since exceptions are handled above
-            logger.warning("Message processing failed, DeliverTag=%s", message.delivery_tag)
-            try:
-                await message.nack(requeue=False)
-            except Exception as e:
-                logger.exception("Error in fallback nack for DeliverTag=%s", message.delivery_tag)
+        
+        #not necessary because of the deadletter queue
+        # else:
+        #     #processing failed, weird case, since exceptions are handled above
+        #     logger.warning("Message processing failed, DeliverTag=%s", message.delivery_tag)
+        #     try:
+        #         await message.nack(requeue=False)
+        #     except Exception as e:
+        #         logger.exception("Error in fallback nack for DeliverTag=%s", message.delivery_tag)
 
 
 
@@ -213,7 +205,6 @@ class AMQPWorker:
                 correlation_id=correlation_id,
                 type=action,
                 reply_to=reply_to,
-                callback_to=callback_action,
                 delivery_mode=DeliveryMode.PERSISTENT #avpoids loss of messages, lower throughput, but reliable
             ),
             routing_key=queue,
