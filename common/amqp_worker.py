@@ -27,9 +27,9 @@ class AMQPWorker:
         self.queue_name = queue_name
         self.callbacks = {}
         # self._use_manual_acks = use_manual_acks # possibility to use manual acks, still testing
-        self._use_manual_acks = False
+        self._use_manual_acks = use_manual_acks
         logger.info(f"AMQPWorker queue name: '{queue_name}'")
-        # logger.info(f"AMQPWorker queue name: '{queue_name}' Manual ACKs: {use_manual_acks}")
+        logger.info(f"AMQPWorker queue name: '{queue_name}' Manual ACKs: {use_manual_acks}")
 
     def register(self, callback):
         """
@@ -74,6 +74,11 @@ class AMQPWorker:
             queue = await self.channel.declare_queue(
                 self.queue_name,
                 durable=True,
+                #DLQ
+                # arguments={
+                #     "x-dead-letter-exchange": self.dlx_name,
+                #     "x-dead-letter-routing-key": self.dlq_name
+                # }
             )
             #manual ack
             if self._use_manual_acks:
@@ -84,74 +89,103 @@ class AMQPWorker:
                 await asyncio.Future()
 
             #auto ack, previous implementation
-            else:
-                async with queue.iterator() as qiterator:
-                    message: AbstractIncomingMessage
-                    async for message in qiterator:
-                        async with message.process(requeue=False, ignore_processed=True):
-                            response = None # Define before try block
-                            try: 
-                                # Decode the message body
-                                data = json.loads(message.body.decode())
-                                message_type = message.type
+            # else:
+            #     async with queue.iterator() as qiterator:
+            #         message: AbstractIncomingMessage
+            #         async for message in qiterator:
+            #             async with message.process(requeue=False, ignore_processed=True):
+            #                 response = None # Define before try block
+            #                 try: 
+            #                     # Decode the message body
+            #                     data = json.loads(message.body.decode())
+            #                     message_type = message.type
 
-                                logger.debug(f" Received message type='{message_type}', "
-                                         f"DeliveryTag={message.delivery_tag}, "
-                                         f"CorrID='{message.correlation_id}'")
+            #                     logger.debug(f" Received message type='{message_type}', "
+            #                              f"DeliveryTag={message.delivery_tag}, "
+            #                              f"CorrID='{message.correlation_id}'")
                                 
-                                # Find the appropriate callback
-                                if message_type in self.callbacks:
-                                    handler = self.callbacks[message_type]
-                                    logger.debug(f"[AutoACK] Calling handler '{handler.__name__}'")
+            #                     # Find the appropriate callback
+            #                     if message_type in self.callbacks:
+            #                         handler = self.callbacks[message_type]
+            #                         logger.debug(f"[AutoACK] Calling handler '{handler.__name__}'")
 
-                                    #call handler with (data, message), now message included for idempotency
-                                    response = await handler(data, message)
+            #                         #call handler with (data, message), now message included for idempotency
+            #                         response = await handler(data, message)
 
-                                    await self._handle_reply(message, response)
-                                else:
-                                    logging.warning(f"No callback registered for message type '{message_type}'")
-                            except Exception:
-                                logging.exception("Processing error for message %r", message)
-                                raise
+            #                         await self._handle_reply(message, response)
+            #                     else:
+            #                         logging.warning(f"No callback registered for message type '{message_type}'")
+            #                 except Exception:
+            #                     logging.exception("Processing error for message %r", message)
+            #                     raise
 
-    # async def on_message(self, message:AbstractIncomingMessage):
-    #     """
-    #     Manual ACK, for idempotency, still testing
-    #     """
-         
-    #     response_tuple = None
-    #     try:
-    #         data = json.loads(message.body.decode())
-    #         message_type = message.type
-    #         logger.debug(f"[ManualACK] Received message type='{message_type}', DeliveryTag={message.delivery_tag}")
+    async def on_message(self, message:AbstractIncomingMessage):
+        """
+        Manual ACK, for idempotency, still testing
+        """
 
-    #         if message_type in self.callbacks:
-    #             handler = self.callbacks[message_type]
-    #             logger.debug(f"[ManualACK] calling handler '{handler.__name__}'")
-    #             # call handler with (data, message) 
-    #             response_tuple = await handler(data, message)
+        response_tuple = None
+        handler = None
+        message_type = None
+        processed_successfully = False
 
-    #             await self._handle_reply(message, response_tuple)
+        try:
+            data = json.loads(message.body.decode())
+            message_type = message.type
+            logger.debug(f" Received message type='{message_type}', DeliveryTag={message.delivery_tag}")
 
-    #             # perform Manual ACK 
-    #             logger.debug(f"[ManualACK] Acking message {message.delivery_tag}")
-    #             await message.ack()
+            if message_type in self.callbacks:
+                handler = self.callbacks[message_type]
+                logger.debug(f"calling handler '{handler.__name__}'")
+                # call handler with (data, message) 
+                response_tuple = await handler(data, message)
 
-    #         else:
-    #             logger.warning(f"[ManualACK] No callback registered for '{message_type}'. Rejecting message.")
-    #             await message.reject(requeue=False) 
+                processed_successfully = True
 
-    #     except json.JSONDecodeError:
-    #         try:
-    #             await message.nack(requeue=False)
-    #         except Exception as e:
-    #             logger.exception("Error nacking message JSONDECODE")
-    #     except Exception as e:
-    #         logger.exception("Error in message processing loop")
-    #         try:
-    #             await message.nack(requeue=False)
-    #         except Exception as e:
-    #             logger.exception("Error nacking message UNKNOWN")
+                await self._handle_reply(message, response_tuple)
+
+            else:
+                logger.warning(f" No callback registered for '{message_type}'. Rejecting message (permanently, since there is no handler). Dont Requeue")
+                await message.reject(requeue=False)
+                return
+
+        except json.JSONDecodeError:
+            logger.exception("Error in message  inJSONDecodeError")
+            try:
+                await message.nac(requeue=False)
+            except Exception as e:
+                logger.exception("Error nacking message JSONDECODE")
+        except Exception as e:
+            logger.exception("Error in message processing loop DeliverTag=%s", message.delivery_tag)
+
+            #retry/DlQ TODO
+            #potentially requeue for some errors??
+            #for now --> just assume processing error -> no requeue
+
+            should_requeue = False
+            try:
+                await message.nack(should_requeue)
+                logger.info("Message nacked DeliverTag=%s", message.delivery_tag)
+            except Exception as e:
+                logger.exception("Error nacking message UNKNOWN")
+            return
+        
+        if processed_successfully:
+            try:
+                await message.ack()
+                logger.info("Message acked DeliverTag=%s", message.delivery_tag)
+            except Exception as e:
+                #processing succceeded, but ack failed
+                #idempotency is important here
+                logger.exception("Error acking message, processing succceeded but ack failed, DeliverTag=%s", message.delivery_tag)
+        else:
+            #processing failed, weird case, since exceptions are handled above
+            logger.warning("Message processing failed, DeliverTag=%s", message.delivery_tag)
+            try:
+                await message.nack(requeue=False)
+            except Exception as e:
+                logger.exception("Error in fallback nack for DeliverTag=%s", message.delivery_tag)
+
 
 
     async def send_message(self, payload, queue, correlation_id, reply_to, action=None, callback_action=None, attempt_id=None):
