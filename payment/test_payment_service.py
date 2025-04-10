@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 import logging 
 
 from app import (
-    db, worker, UserValue
+    db_master, worker, UserValue  
 )
 
 class MockAMQPClient:
@@ -40,9 +40,7 @@ def event_loop():
 
 @pytest.fixture(scope="function", autouse=True)
 def flush_db():
-    # Make sure 'db' refers to the correct redis connection used by app.py
-    db.flushall()
-    # ++ flush idempotency DB if it's separate and accessible
+    db_master.flushall()  
 
 @pytest.mark.asyncio
 async def test_successful_payment(amqp_client):

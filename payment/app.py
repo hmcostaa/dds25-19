@@ -4,7 +4,7 @@ import atexit
 import sys
 import uuid
 import asyncio
-
+from redis import Sentinel
 import redis
 
 from flask import Flask, jsonify, abort, Response
@@ -45,29 +45,27 @@ DB_ERROR_STR = "DB error"
 #pytest --maxfail=1 --disable-warnings -q
 
 
-db = redis.Redis(
-    host=os.environ.get('REDIS_HOST', 'localhost'),
-    port=int(os.environ.get('REDIS_PORT', 6379)),
-    password=os.environ.get('REDIS_PASSWORD', None),
-    db=int(os.environ.get('REDIS_DB', 0)),
-    decode_responses=False
-)
-db.ping()
-logging.info("Connected to traditional Redis.")
+sentinel = Sentinel([
+    (os.environ.get('REDIS_SENTINEL_1', 'localhost'), 26379),
+    (os.environ.get('REDIS_SENTINEL_2', 'localhost'), 26380),
+    (os.environ.get('REDIS_SENTINEL_3', 'localhost'), 26381)
+], socket_timeout=0.1, password=os.environ.get('REDIS_PASSWORD', None))
 
-idempotency_db_conn = redis.Redis(
-    host=os.environ.get('IDEMPOTENCY_REDIS_HOST', os.environ.get('REDIS_HOST', 'localhost')),
-    port=int(os.environ.get('IDEMPOTENCY_REDIS_PORT', os.environ.get('REDIS_PORT', 6379))),
-    password=os.environ.get('IDEMPOTENCY_REDIS_PASSWORD', os.environ.get('REDIS_PASSWORD', None)),
-    db=int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)),
-    decode_responses=False
-)
-idempotency_db_conn.ping()
+db_master = sentinel.master_for('payment-master', socket_timeout=0.1, decode_responses=False)
+db_slave = sentinel.slave_for('payment-master', socket_timeout=0.1, decode_responses=False)
+
+logging.info("Connected to Redis Sentinel.")
+
+#no slave since idempotency is critical to payment service
+idempotency_db_conn = db_master 
+
 logging.info("Connected to idempotency Redis.")
 
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
+    idempotency_db_conn.close()
 
 
 atexit.register(close_db_connection)
@@ -80,7 +78,7 @@ class UserValue(Struct):
 def get_user_from_db(user_id: str) -> Optional[UserValue]:
     try:
         # get serialized data
-        entry: Optional[bytes] = db.get(user_id)
+        entry: Optional[bytes] = db_slave.get(user_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -102,7 +100,7 @@ async def atomic_update_user(user_id: str, update_func):
 
     # async with db.pipeline(transaction=True) as pipe: # async pipeline, should probably be used TODO
     for attempt in range(max_retries):
-        pipe = db.pipeline(transaction=True)
+        pipe = db_master.pipeline(transaction=True)
         try:
             #idempotency check?
             # if ?
@@ -174,7 +172,7 @@ async def create_user(data):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
-        db.set(key, value)
+        db_master.set(key, value)
         return {'user_id': key}, 200
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
@@ -189,7 +187,7 @@ async def batch_init_users(data):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        db_master.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
     return {"msg": "Batch init for users successful"}, 200
@@ -339,7 +337,7 @@ async def pay(data):
             logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
             # operation finished, but failed to record its state
             # replay if the caller retreis?? for now just return res, with logging, not worryyish
-            
+
         except Exception as e:
             logging.critical("FAILED TO STORE ::", idempotency_key, e)
             # prevent auto-ACK. Manual intervention |0|
