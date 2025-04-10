@@ -96,10 +96,13 @@ def get_user_from_db(user_id: str) -> Optional[UserValue]:
 async def atomic_update_user(user_id: str, update_func):
     #retry? backoff/?
     #for attempts i tn range(max_retries):
+    
+    max_retries = 5
+    base_backoff = 50 
 
     # async with db.pipeline(transaction=True) as pipe: # async pipeline, should probably be used TODO
-    pipe = db.pipeline(transaction=True)
-    while True:
+    for attempt in range(max_retries):
+        pipe = db.pipeline(transaction=True)
         try:
             #idempotency check?
             # if ?
@@ -118,17 +121,16 @@ async def atomic_update_user(user_id: str, update_func):
                     logging.warning("Atomic update: User: %s", user_id)
                     return None, f"User {user_id} not found"
             
-            while True:
-                #disistuingish between leader and follower??
-                #db_master.pipeline()?
-                try:
-                    user_val: UserValue = msgpack.Decoder(UserValue).decode(entry)
-                except MsgspecDecodeError:
-                    pipe.reset()
-                    logging.error("Atomic update: Decode error for user %s", user_id)
-                    return None, "Internal data format error"
-                
+            #disistuingish between leader and follower??
+            #db_master.pipeline()?
+            try:
+                user_val: UserValue = msgpack.Decoder(UserValue).decode(entry)
+            except MsgspecDecodeError:
+                pipe.reset()
+                logging.error("Atomic update: Decode error for user %s", user_id)
+                return None, "Internal data format error"
             
+            try:
                 updated_user = update_func(user_val)
                 #synchronous
                 #error?
@@ -137,10 +139,17 @@ async def atomic_update_user(user_id: str, update_func):
 
                 pipe.execute() #execute if no other client modified user_id (pipe.watch)
                 return updated_user, None #succesfull
+            except ValueError as e:
+                pipe.reset()
+                raise e
                 
         except WatchError:
-            #key was modified by another client
+            #key was modified between watch and execute, retry backoff 
             #backoff?? TODO
+            backoff_multiplier = (2 ** attempt) * (1 + random.random() * 0.1)
+            backoff = base_backoff * backoff_multiplier
+            
+            await asyncio.sleep(backoff / 1000)
             continue #loop again
 
         # except redis.WatchError:
@@ -296,12 +305,14 @@ async def pay(data):
         logging.warning(f"'pay' logic failed: {e}")
     except Exception as e:
         logging.exception("internal error")
-        error_msg = "internal error"
+        error_msg = str(e)
+
     
     if error_msg:
         logging.error(f"'pay' logic failed: {error_msg}")
+        logging.debug(f"error_msg: {error_msg}")
         if "insufficient credit" in error_msg.lower():
-            status_code = 400
+            status_code = 400 
         elif "not found" in error_msg.lower(): 
             status_code = 404
         else: 
@@ -351,10 +362,10 @@ async def cancel_payment(data):
             return {"error": "Missing required fields"}, 400
         
         if amount <= 0:
-            abort(400, "Transaction amount must be positive")
+            return {"error": "Transaction amount must be positive"}, 400
     except (ValueError, TypeError):
         return {"error": "Invalid amount specified"}, 400
-
+    
 
     def updater(user: UserValue) -> UserValue:
         user.credit += amount
