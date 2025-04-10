@@ -11,6 +11,8 @@ async def startup():
     await rpc_client.connect(os.environ["AMQP_URL"])
 
 
+
+
 ######## Order Service Routes ########
 
 
@@ -33,7 +35,7 @@ async def find_order(order_id):
             "order_id": order_id
         }
     }
-    response = await rpc_client.call(payload, "order_queue")
+    response = await rpc_client.call("order_queue","find_order",payload )
     return response
 
 @app.route("/order/add_item/<order_id>/<item_id>/<quantity>")
@@ -43,11 +45,29 @@ async def add_item(order_id, item_id, quantity):
         "data": {
             "order_id": order_id,
             "item_id": item_id,
-            "quantity": quantity
+            "quantity": int (quantity)
         }
     }
-    response = await rpc_client.call(payload, "order_queue")
+    response = await rpc_client.call("order_queue","add_item",payload )
     return response
+@app.route("/orders/checkout/<order_id>", methods=["POST"])
+async def checkout(order_id):
+    payload = {
+        "type": "process_checkout_request",
+        "data": { "order_id": order_id }
+    }
+    response = await rpc_client.call("order_queue", "process_checkout_request", payload)
+    return response
+
+@app.route("/orders/status/<order_id>", methods=["GET"])
+async def saga_status(order_id):
+    payload = {
+        "type": "get_saga_state",
+        "data": { "order_id": order_id }
+    }
+    response = await rpc_client.call("order_queue", "get_saga_state", payload)
+    return response
+
 
 # The following routes are used to interact with the stock service
 
@@ -125,7 +145,7 @@ async def add_stock(item_id, amount):
             "amount": amount
         }
     }
-    response = await rpc_client.call(payload, "stock_queue")
+    response = await rpc_client.call_stock("find_item", {"item_id":item_id})
     return response
 
 # The following routes are used to interact with the payment service

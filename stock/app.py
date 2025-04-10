@@ -1,31 +1,35 @@
 import logging
 import os
 import atexit
+import time
 import uuid
 import asyncio
 import redis
 from common.amqp_worker import AMQPWorker
+from global_idempotency import helper
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+from redis import Sentinel
 
+from global_idempotency.helper import check_idempotency_key
 
 DB_ERROR_STR = "DB error"
 
-
-
 app = Flask("stock-service")
+SERVICE_NAME = "stock-service"
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+sentinel= Sentinel([
+    (os.environ['REDIS_SENTINEL_1'],26379),
+    (os.environ['REDIS_SENTINEL_2'],26380),
+    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-
-
+db_master=sentinel.master_for('stock-master', socket_timeout=0.1, decode_responses=True)
+db_slave=sentinel.slave_for('stock-master', socket_timeout=0.1, decode_responses=True)
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
 
 
 atexit.register(close_db_connection)
@@ -36,10 +40,15 @@ class StockValue(Struct):
     price: int
 
 
+class StockValue(Struct):
+    stock: int
+    price: int
+
+
 def get_item_from_db(item_id: str) -> StockValue | None:
     # get serialized data
     try:
-        entry: bytes = db.get(item_id)
+        entry: bytes = db_slave.get(item_id)
     except redis.exceptions.RedisError:
         return DB_ERROR_STR, 400
     # deserialize data if it exists else return null
@@ -52,7 +61,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 def atomic_update_item(item_id: str, update_func):
     while True:
         try:
-            pipe = db.pipeline(transaction=True)  # Create Redis pipeline
+            pipe = db_master.pipeline(transaction=True)  # Create Redis pipeline
 
             pipe.watch(item_id)  # Watch the item_id for changes
             entry = pipe.get(item_id)  # Retrieve the current value for item_id
@@ -102,7 +111,7 @@ async def create_item(data):
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        db.set(key, value)
+        db_master.set(key, value)
     except redis.exceptions.RedisError as re:
         return str(re), 400
     except Exception as e:
@@ -120,7 +129,7 @@ async def batch_init_stock(data):
     kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        db_master.mset(kv_pairs)
     except redis.exceptions.RedisError as re:
         return str(re), 400
     except Exception as e:
@@ -166,7 +175,10 @@ async def add_stock(data):
 async def remove_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
-
+    idempotency_key=helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),data.get("order_id"),data.get("attempt_id"))
+    if check_idempotency_key(idempotency_key):
+        app.logger.info(f"[IDEMPOTENCY] Duplicate remove stock for {idempotency_key}")
+        return {"msg": "ALREADY_PROCESSED"}, 200
     def stock_value_change2(item: StockValue) -> StockValue:
         if item.stock - int(amount) < 0:
             return None, 400

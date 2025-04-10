@@ -20,6 +20,7 @@ from global_idempotency.app import (
         store_idempotent_result,
         IdempotencyResultTuple
     )
+from global_idempotency import helper
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -263,8 +264,7 @@ async def pay(data):
         logging.error("Unexpected error, amount:.", amount)
         return {"error": "Invalid amount?"}, 400
     
-    idempotency_key = f"idempotent:{SERVICE_NAME}:pay:{user_id}:{order_id}:{attempt_id}"
-    idempotency_utf8 = idempotency_key.encode('utf-8')
+    idempotency_key,idempotency_utf8 = helper.generate_idempotency_key(SERVICE_NAME, order_id, attempt_id)
     # stored_result = check_idempotency(idempotency_key, idempotency_db_conn)
     # if stored_result is not None:
     #     logging.info(f"PAY: Duplicate attempt {attempt_id}. Returning stored result.")
@@ -354,6 +354,44 @@ async def pay(data):
         return res
     
     
+@worker.register
+async def remove_credit(data):
+    user_id = data.get("user_id")
+    amount = int(data.get("amount", 0))
+
+    if not user_id or amount <= 0:
+        return {"error": "Invalid request"}, 400
+
+    def updater(user: UserValue) -> UserValue:
+        if user.credit < amount:
+            raise ValueError("Insufficient funds")
+        user.credit -= amount
+        return user
+
+    updated_user, error_msg = await atomic_update_user(user_id, updater)
+
+    if error_msg:
+        return {"error": error_msg}, 400
+    return {"msg": f"Removed {amount} from user {user_id}"}, 200
+
+@worker.register
+async def reverse(data):
+    user_id = data.get("user_id")
+    amount = int(data.get("amount", 0))
+
+    if not user_id or amount <= 0:
+        return {"error": "Invalid reverse amount"}, 400
+
+    def updater(user: UserValue) -> UserValue:
+        user.credit += amount
+        return user
+
+    updated_user, error_msg = await atomic_update_user(user_id, updater)
+
+    if error_msg:
+        return {"error": error_msg}, 400
+    return {"msg": f"Refunded {amount} to user {user_id}"}, 200
+
 
 
 @worker.register
