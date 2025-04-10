@@ -3,29 +3,29 @@ import os
 import atexit
 import uuid
 import asyncio
-from common.amqp_worker import AMQPWorker
 import redis
+from common.amqp_worker import AMQPWorker
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
-from redis import Sentinel
+
 
 DB_ERROR_STR = "DB error"
 
+
+
 app = Flask("stock-service")
 
+db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
+                              port=int(os.environ['REDIS_PORT']),
+                              password=os.environ['REDIS_PASSWORD'],
+                              db=int(os.environ['REDIS_DB']))
 
-sentinel= Sentinel([
-    (os.environ['REDIS_SENTINEL_1'],26379),
-    (os.environ['REDIS_SENTINEL_2'],26380),
-    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-db_master=sentinel.master_for('order-master', socket_timeout=0.1, decode_responses=True)
-db_slave=sentinel.slave_for('order-master', socket_timeout=0.1, decode_responses=True)
+
 
 def close_db_connection():
-    db_master.close()
-    db_slave.close()
+    db.close()
 
 
 atexit.register(close_db_connection)
@@ -41,91 +41,59 @@ def get_item_from_db(item_id: str) -> StockValue | None:
     try:
         entry: bytes = db.get(item_id)
     except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        return DB_ERROR_STR, 400
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
         # if item does not exist in the database; abort
-        abort(400, f"Item: {item_id} not found!")
-    return entry
+        return f"Item: {item_id} not found!", 400
+    return entry, 200
 
+def atomic_update_item(item_id: str, update_func):
+    while True:
+        try:
+            pipe = db.pipeline(transaction=True)  # Create Redis pipeline
 
-# @app.post('/item/create/<price>')
-# def create_item(price: int):
-#     key = str(uuid.uuid4())
-#     app.logger.debug(f"Item: {key} created")
-#     value = msgpack.encode(StockValue(stock=0, price=int(price)))
-#     try:
-#         db.set(key, value)
-#     except redis.exceptions.RedisError:
-#         return abort(400, DB_ERROR_STR)
-#     return jsonify({'item_id': key})
+            pipe.watch(item_id)  # Watch the item_id for changes
+            entry = pipe.get(item_id)  # Retrieve the current value for item_id
 
+            item_val: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
-def batch_init_users(n: int, starting_stock: int, item_price: int):
-    n = int(n)
-    starting_stock = int(starting_stock)
-    item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
+            # If the item value is None, abort and return an error message
+            if item_val is None:
+                pipe.reset()  # Reset the pipeline
+                f"Item: {item_id} not found!", 400  # Return 400 error with message
 
+            updated_item, response_code = update_func(item_val)
+            if response_code == 400:
+                pipe.reset()  # Reset the pipeline
+                return "update function failure", 400
 
-# @app.get('/find/<item_id>')
-# def find_item(item_id: str):
-#     item_entry: StockValue = get_item_from_db(item_id)
-#     return jsonify(
-#         {
-#             "stock": item_entry.stock,
-#             "price": item_entry.price
-#         }
-#     )
+            pipe.multi()  # Start a transaction block
 
+            # Serialize and set the updated item value in Redis
+            pipe.set(item_id, msgpack.encode(updated_item))
 
-# @app.post('/add/<item_id>/<amount>')
-# def add_stock(item_id: str, amount: int):
-#     item_entry: StockValue = get_item_from_db(item_id)
-#     # update stock, serialize and update database
-#     item_entry.stock += int(amount)
-#     try:
-#         db.set(item_id, msgpack.encode(item_entry))
-#     except redis.exceptions.RedisError:
-#         return abort(400, DB_ERROR_STR)
-#     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+            # Execute the transaction if no one else modified the item_id (based on pipe.watch)
+            pipe.execute()
 
+        except redis.WatchError:
+            continue  # Retry the entire operation
 
-@app.post('/subtract/<item_id>/<amount>')
-def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+        except redis.RedisError as re:
+            # Catch any other Redis-related errors and abort with a 400 status
+            return str(re) , 400
+
+        except Exception as e:
+            # Catch any other unexpected exceptions to prevent silent failures
+            return f"Unexpected error: {str(e)}", 401
+        else:
+            return "Atomic update successful", 200
 
 worker = AMQPWorker(
     amqp_url=os.environ["AMQP_URL"],
     queue_name="stock_queue",
 )
-
-@worker.register
-async def find_item(data):
-    item_id = data.get("item_id")
-    item_entry: StockValue = get_item_from_db(item_id)
-    return {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
 
 @worker.register
 async def create_item(data):
@@ -135,26 +103,85 @@ async def create_item(data):
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return {'item_id': key}
+    except redis.exceptions.RedisError as re:
+        return str(re), 400
+    except Exception as e:
+        # Catch any other unexpected exceptions to prevent silent failures
+        return f"Unexpected error: {str(e)}", 401
+
+    return {'item_id': key}, 200
+
 
 @worker.register
-def add_stock(data):
+async def batch_init_stock(data):
+    n = int(data.get("n"))
+    starting_stock = int(data.get("starting_stock"))
+    item_price = int(data.get("item_price"))
+    kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+                                  for i in range(n)}
+    try:
+        db.mset(kv_pairs)
+    except redis.exceptions.RedisError as re:
+        return str(re), 400
+    except Exception as e:
+        # Catch any other unexpected exceptions to prevent silent failures
+        return f"Unexpected error: {str(e)}", 401
+
+    return {'msg': f"{kv_pairs.keys()}"}, 200
+
+
+@worker.register
+async def find_item(data):
+    item_id = data.get("item_id")
+    item_entry, response_code = get_item_from_db(item_id)
+
+    if response_code == 400:
+        return item_entry, 400
+
+    return {"stock": item_entry.stock,
+            "price": item_entry.price } , 200
+
+@worker.register
+async def add_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return {"msg": f"Item: {item_id} stock updated to: {item_entry.stock}"}
+
+    def stock_value_change1(item: StockValue) -> StockValue:
+        item.stock += int(amount)
+        return item, 200
+    response, response_code = atomic_update_item(item_id,stock_value_change1)
+    if response_code != 200:
+        return response, 401
+
+    updated_item, response_code = get_item_from_db(item_id)
+    if response_code != 200:
+        return updated_item, 402
+
+    return {
+            "UpdatedStock": updated_item.stock
+            }, 200
+
+
+@worker.register
+async def remove_stock(data):
+    item_id = data.get("item_id")
+    amount = data.get("amount")
+
+    def stock_value_change2(item: StockValue) -> StockValue:
+        if item.stock - int(amount) < 0:
+            return None, 400
+        item.stock -= int(amount)
+        return item, 200
+    response, response_code = atomic_update_item(item_id,stock_value_change2)
+    if response_code == 400:
+        return response, 400
+
+    updated_item, response_code = get_item_from_db(item_id)
+    if response_code == 400:
+        return DB_ERROR_STR, 400
+    return {
+            "UpdatedStock": updated_item.stock
+            }, 200
 
 if __name__ == '__main__':
     asyncio.run(worker.start())
-else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)

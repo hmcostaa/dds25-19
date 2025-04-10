@@ -58,20 +58,63 @@ async def find_item(item_id):
         "data": {
             "item_id": item_id
         }
+        "item_id": item_id,
+        "amount": amount
+    }
+    response, code = await rpc_client.call(queue="stock_queue",
+                                           action="remove_stock",
+                                           payload=payload)
+    return response, code
+
+
+@app.route("/stock/add/<item_id>/<amount>", methods=["POST"])
+async def add_stock_item(item_id, amount):
+    payload = {
+        "item_id": item_id,
+        "amount": amount
     }
     response = await rpc_client.call(payload, "stock_queue")
     return response
+    response, code = await rpc_client.call(queue="stock_queue",
+                                           action="add_stock",
+                                           payload=payload)
+    return response, code
 
 @app.route("/stock/create_item/<price>")
 async def create_item(price):
+    response, code = await rpc_client.call(queue="stock_queue",
+                                           action="create_item",
+                                           payload={"price": price})
+    return response, code
+
+@app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
+async def batch_init(n,starting_stock,item_price):
+    payload = {
+        "n": n,
+        "starting_stock" : starting_stock,
+        "item_price" : item_price
+    }
+    response, code = await rpc_client.call(queue="stock_queue",
+                                           action="batch_init_stock",
+                                           payload=payload)
+    return response, code
+
+######## Payment Service Routes ########
+
+
+@app.route("/payment/pay/<user_id>/<amount>", methods=["POST"])
+async def pay(user_id, amount):
     payload = {
         "type": "create_item",
         "data": {
             "price": price
         }
     }
-    response = await rpc_client.call(payload, "stock_queue")
-    return response
+    response, code = await rpc_client.call(queue="payment_queue",
+                                           action="pay",
+                                           payload=payload)
+    return response, code
+
 
 @app.route("/stock/add_stock/<item_id>/<amount>")
 async def add_stock(item_id, amount):

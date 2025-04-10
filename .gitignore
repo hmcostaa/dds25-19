@@ -1,4 +1,4 @@
-# Byte-compiled files
+bin# Byte-compiled files
 __pycache__/
 order/orchestrator
 # Environments
