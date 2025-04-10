@@ -333,8 +333,13 @@ async def pay(data):
             was_set = store_idempotent_result(idempotency_key, res, idempotency_db_conn)
             if not was_set:
                 # Race condition
-                logging.error("race Condition key:", idempotency_key)
+                logging.warning(f"Idempotency key {idempotency_key} already existed or failed to set (race condition likely lost).")
                 # decide? Raise error for NACK or allow ACK? raising is safer???  state-wise? TODO
+        except (IdempotencyDataError, IdempotencyStoreConnectionError) as e:
+            logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
+            # operation finished, but failed to record its state
+            # replay if the caller retreis?? for now just return res, with logging, not worryyish
+            
         except Exception as e:
             logging.critical("FAILED TO STORE ::", idempotency_key, e)
             # prevent auto-ACK. Manual intervention |0|
