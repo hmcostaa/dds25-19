@@ -106,7 +106,8 @@ def check_idempotent_operation(key:str, redis_conn: redis.Redis)->Optional[Idemp
     
 def store_idempotent_result(
         key:str,
-        result:Dict,
+        result_tuple:IdempotencyResultTuple, #didnt match check idempotent
+        redis_conn: redis.Redis,
         metadata:Dict=None) -> bool:
     """
         Store the result of an operation for future idempotency checks.
@@ -120,15 +121,22 @@ def store_idempotent_result(
         - True if storage was successful, False otherwise
         """
     try:
-        result_bytes = msgpack.encode(result)
+        result_bytes = msgpack.encode(result_tuple)
         
     except MsgspecDecodeError as e:
         logger.error(f"Failed to encode msgpack {key}: {e}")
         raise IdempotencyDataError(f"Failed to encode msgpack {key}: {e}")
     
     try:
-        idempotency_db.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
-        return True
+        # idempotency_db.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
+        # line executed regardless whether set succeeded or not --> always true was returned
+        # set should have been 'captured'
+        was_set = redis_conn.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
+        return was_set is True
+
+    except redis.exceptions.RedisError as e:
+        logger.error(f"Redis error storing idempotency result: {str(e)}")
+
     except Exception as e:
         logger.error(f"Error storing idempotency result: {str(e)}")
         return False
