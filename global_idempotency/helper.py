@@ -111,9 +111,9 @@ def store_idempotent_result(
     try:
         idempotency_db_conn.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
         return True
-    except Exception as e:
+    except redis.exceptions.RedisError as e:
         logger.error(f"Error storing idempotency result: {str(e)}")
-        return False
+        raise IdempotencyStoreConnectionError(f"Error storing idempotency result: {str(e)}")
 
 def check_idempotency_key(key: str)->bool:
     redis_conn = idempotency_db_conn
@@ -121,4 +121,4 @@ def check_idempotency_key(key: str)->bool:
         return redis_conn.exists(key) == 1
     except Exception as e:
         print(f"[IDEMPOTENCY] Redis error while checking key {key}: {e}")
-        return False
+        raise IdempotencyStoreConnectionError("Redis error while checking key {key}: {e}")

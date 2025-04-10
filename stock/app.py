@@ -12,7 +12,7 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 from redis import Sentinel
 
-from global_idempotency.helper import check_idempotency_key
+from global_idempotency.helper import check_idempotency_key, store_idempotent_result, IdempotencyStoreConnectionError
 
 DB_ERROR_STR = "DB error"
 
@@ -128,6 +128,16 @@ async def batch_init_stock(data):
     item_price = int(data.get("item_price"))
     kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
+    idempotency_key = helper.generate_idempotency_key(SERVICE_NAME, data.get("user_id"), data.get("order_id"),
+                                                      data.get("attempt_id"))
+    try:
+        if check_idempotency_key(idempotency_key):
+            app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
+            return {"msg": "ALREADY_PROCESSED"}, 200
+    except IdempotencyStoreConnectionError as e:
+        app.logger.error(str(e))
+        return{"msg": "Redis error during idempotency check"}, 500
+    store_idempotent_result(idempotency_key)
     try:
         db_master.mset(kv_pairs)
     except redis.exceptions.RedisError as re:
@@ -154,14 +164,22 @@ async def find_item(data):
 async def add_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
-
+    idempotency_key = helper.generate_idempotency_key(SERVICE_NAME, data.get("user_id"), data.get("order_id"),
+                                                      data.get("attempt_id"))
+    try:
+        if check_idempotency_key(idempotency_key):
+            app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
+            return {"msg": "ALREADY_PROCESSED"}, 200
+    except IdempotencyStoreConnectionError as e:
+        app.logger.error(str(e))
+        return{"msg": "Redis error during idempotency check"}, 500
     def stock_value_change1(item: StockValue) -> StockValue:
         item.stock += int(amount)
         return item, 200
     response, response_code = atomic_update_item(item_id,stock_value_change1)
     if response_code != 200:
         return response, 401
-
+    store_idempotent_result(idempotency_key)
     updated_item, response_code = get_item_from_db(item_id)
     if response_code != 200:
         return updated_item, 402
@@ -176,9 +194,13 @@ async def remove_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
     idempotency_key=helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),data.get("order_id"),data.get("attempt_id"))
-    if check_idempotency_key(idempotency_key):
-        app.logger.info(f"[IDEMPOTENCY] Duplicate remove stock for {idempotency_key}")
-        return {"msg": "ALREADY_PROCESSED"}, 200
+    try:
+        if check_idempotency_key(idempotency_key):
+            app.logger.info(f"[IDEMPOTENCY] Duplicate remove stock for {idempotency_key}")
+            return {"msg": "ALREADY_PROCESSED"}, 200
+    except IdempotencyStoreConnectionError as e:
+        app.logger.error(str(e))
+        return{"msg": "Redis error during idempotency check"}, 500
     def stock_value_change2(item: StockValue) -> StockValue:
         if item.stock - int(amount) < 0:
             return None, 400
@@ -187,7 +209,7 @@ async def remove_stock(data):
     response, response_code = atomic_update_item(item_id,stock_value_change2)
     if response_code == 400:
         return response, 400
-
+    store_idempotent_result(idempotency_key)
     updated_item, response_code = get_item_from_db(item_id)
     if response_code == 400:
         return DB_ERROR_STR, 400

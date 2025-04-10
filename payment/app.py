@@ -9,6 +9,8 @@ import redis
 
 from flask import Flask, jsonify, abort, Response
 from typing import Optional, Tuple
+
+from redis import Sentinel
 from redis.exceptions import WatchError, RedisError
 import random
 import logging
@@ -46,14 +48,16 @@ DB_ERROR_STR = "DB error"
 #pytest --maxfail=1 --disable-warnings -q
 
 
-db = redis.Redis(
-    host=os.environ.get('REDIS_HOST', 'localhost'),
-    port=int(os.environ.get('REDIS_PORT', 6379)),
-    password=os.environ.get('REDIS_PASSWORD', None),
-    db=int(os.environ.get('REDIS_DB', 0)),
-    decode_responses=False
-)
-db.ping()
+sentinel = Sentinel([
+    (os.environ['REDIS_SENTINEL_1'], 26379),
+    (os.environ['REDIS_SENTINEL_2'], 26380),
+    (os.environ['REDIS_SENTINEL_3'], 26381)], socket_timeout=0.1, password=os.environ['REDIS_PASSWORD'])
+
+db_master = sentinel.master_for('payment-master', socket_timeout=0.1, decode_responses=True)
+db_slave = sentinel.slave_for('payment-master', socket_timeout=0.1, decode_responses=True)
+
+db_master.connect()
+db_slave.close()
 logging.info("Connected to traditional Redis.")
 
 idempotency_db_conn = redis.Redis(
@@ -68,7 +72,8 @@ logging.info("Connected to idempotency Redis.")
 
 
 def close_db_connection():
-    db.close()
+    db_master.close()
+    db_slave.close()
 
 
 atexit.register(close_db_connection)
@@ -81,7 +86,7 @@ class UserValue(Struct):
 def get_user_from_db(user_id: str) -> Optional[UserValue]:
     try:
         # get serialized data
-        entry: Optional[bytes] = db.get(user_id)
+        entry: Optional[bytes] = db_slave.get(user_id)
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -103,7 +108,7 @@ async def atomic_update_user(user_id: str, update_func):
 
     # async with db.pipeline(transaction=True) as pipe: # async pipeline, should probably be used TODO
     for attempt in range(max_retries):
-        pipe = db.pipeline(transaction=True)
+        pipe = db_master.pipeline(transaction=True)
         try:
             #idempotency check?
             # if ?
@@ -175,7 +180,7 @@ async def create_user(data):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
-        db.set(key, value)
+        db_master.set(key, value)
         return {'user_id': key}, 200
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
@@ -190,7 +195,7 @@ async def batch_init_users(data):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
+        db_master.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
     return {"msg": "Batch init for users successful"}, 200
