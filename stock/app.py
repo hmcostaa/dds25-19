@@ -117,6 +117,17 @@ async def create_item(data):
     except Exception as e:
         # Catch any other unexpected exceptions to prevent silent failures
         return f"Unexpected error: {str(e)}", 401
+    idempotency_key = helper.generate_idempotency_key(SERVICE_NAME, data.get("user_id"), data.get("order_id"),
+                                                      data.get("attempt_id"))
+    try:
+        if check_idempotency_key(idempotency_key):
+            app.logger.info(f"[IDEMPOTENCY] Duplicate batch init stock for {idempotency_key}")
+            return {"msg": "ALREADY_PROCESSED"}, 200
+    except IdempotencyStoreConnectionError as e:
+        app.logger.error(str(e))
+        return{"msg": "Redis error during idempotency check"}, 500
+    response_data = {"status": "success", "step": "item created"}
+    store_idempotent_result(idempotency_key,response_data)
 
     return {'item_id': key}, 200
 
@@ -130,14 +141,7 @@ async def batch_init_stock(data):
                                   for i in range(n)}
     idempotency_key = helper.generate_idempotency_key(SERVICE_NAME, data.get("user_id"), data.get("order_id"),
                                                       data.get("attempt_id"))
-    try:
-        if check_idempotency_key(idempotency_key):
-            app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
-            return {"msg": "ALREADY_PROCESSED"}, 200
-    except IdempotencyStoreConnectionError as e:
-        app.logger.error(str(e))
-        return{"msg": "Redis error during idempotency check"}, 500
-    store_idempotent_result(idempotency_key)
+
     try:
         db_master.mset(kv_pairs)
     except redis.exceptions.RedisError as re:
@@ -145,8 +149,18 @@ async def batch_init_stock(data):
     except Exception as e:
         # Catch any other unexpected exceptions to prevent silent failures
         return f"Unexpected error: {str(e)}", 401
+    try:
+        if check_idempotency_key(idempotency_key):
+            app.logger.info(f"[IDEMPOTENCY] Duplicate batch init stock for {idempotency_key}")
+            return {"msg": "ALREADY_PROCESSED"}, 200
+    except IdempotencyStoreConnectionError as e:
+        app.logger.error(str(e))
+        return {"msg": "Redis error during idempotency check"}, 500
+    response_data = {"status": "success", "step": "batch init stock added"}
+    store_idempotent_result(idempotency_key, response_data)
 
     return {'msg': f"{kv_pairs.keys()}"}, 200
+
 
 
 @worker.register
@@ -179,7 +193,8 @@ async def add_stock(data):
     response, response_code = atomic_update_item(item_id,stock_value_change1)
     if response_code != 200:
         return response, 401
-    store_idempotent_result(idempotency_key)
+    response_data = {"status": "success", "step": "stock added"}
+    store_idempotent_result(idempotency_key,response_data)
     updated_item, response_code = get_item_from_db(item_id)
     if response_code != 200:
         return updated_item, 402
@@ -209,7 +224,8 @@ async def remove_stock(data):
     response, response_code = atomic_update_item(item_id,stock_value_change2)
     if response_code == 400:
         return response, 400
-    store_idempotent_result(idempotency_key)
+    response_data = {"status": "success", "step": "stock removed"}
+    store_idempotent_result(idempotency_key, response_data)
     updated_item, response_code = get_item_from_db(item_id)
     if response_code == 400:
         return DB_ERROR_STR, 400

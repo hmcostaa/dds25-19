@@ -23,7 +23,7 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort
 import warnings
 
-from global_idempotency.helper import check_idempotency_key
+from global_idempotency.helper import check_idempotency_key, IdempotencyStoreConnectionError
 
 warnings.filterwarnings("ignore", message=".*Python 2.7.*")
 
@@ -232,10 +232,16 @@ async def process_checkout_request(data, message):
         attempt_id = str(message.delivery_tag) if message else str(uuid.uuid4())
         logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}, . Saga ID: {saga_id}")
 
-        idempotency_key = f"idempotent:orchestrator:start_checkout:{order_id}:{attempt_id}"
-
-        existing_result = global_idempotency.check_idempotent_key(idempotency_key)
-
+        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),order_id,saga_id)
+        try:
+            if check_idempotency_key(idempotency_key):
+               app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
+               return
+        except IdempotencyStoreConnectionError as e:
+            app.logger.error(str(e))
+            return {"msg": "Redis error during idempotency check"}, 500
+        response_data = {"status": "success", "step": "checkout"}
+        global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
         # Initialize saga state
         update_saga_state(saga_id, "SAGA_STARTED", {
             "order_id": order_id,
@@ -305,6 +311,12 @@ async def process_stock_completed(data):
     try:
         saga_id = data.get('saga_id')
         order_id = data.get('order_id')
+        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, order_id, saga_id,
+                                                                             "process_stock_completed")
+
+        if check_idempotency_key(idempotency_key):
+            logger.info(f"[IDEMPOTENCY] Skipping duplicate stock step for {idempotency_key}")
+            return
 
         logger.info(f"[Order Orchestrator] Stock reservation completed for saga={saga_id}, order={order_id}")
         update_saga_state(saga_id, "STOCK_RESERVATION_COMPLETED")
@@ -332,7 +344,8 @@ async def process_stock_completed(data):
         worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
                             action="remove_credit", reply_to="orchestrator_queue",
                             callback_action="process_payment_completed")
-
+        response_data = {"status": "success", "step": "stock reservation completed"}
+        global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
         return
 
     except Exception as e:
@@ -363,34 +376,34 @@ async def process_stock_completed(data):
             })
 
 
-@worker.register
-async def rollback_stock(order_id: str):
-    order = get_order_from_db(order_id)
-    items = order.items
-    for item_id, quantity in items:
-        payload = {
-            "type": "unlock_stock",
-            "data": {
-                "item_id": item_id,
-                "qunatity": quantity
-            }
-        }
-        await rpc_client.call(payload, "stock_queue")
-    update_saga_state(order_id, "STOCK_UNLOCKED")
-
-
-@worker.register
-async def rollback_payment(order_id: str, user_id: str, amount: int):
-    payload = {
-        "type": "add_credit",
-        "data": {
-            "user_id": user_id,
-            "amount": amount,
-            "order_id": order_id
-        }
-    }
-    await rpc_client.call(payload, "payment_queue")
-    update_saga_state(order_id, "PAYMENT_REVERSED")
+# @worker.register
+# async def rollback_stock(order_id: str):
+#     order = get_order_from_db(order_id)
+#     items = order.items
+#     for item_id, quantity in items:
+#         payload = {
+#             "type": "unlock_stock",
+#             "data": {
+#                 "item_id": item_id,
+#                 "qunatity": quantity
+#             }
+#         }
+#         await rpc_client.call(payload, "stock_queue")
+#     update_saga_state(order_id, "STOCK_UNLOCKED")
+#
+#
+# @worker.register
+# async def rollback_payment(order_id: str, user_id: str, amount: int):
+#     payload = {
+#         "type": "add_credit",
+#         "data": {
+#             "user_id": user_id,
+#             "amount": amount,
+#             "order_id": order_id
+#         }
+#     }
+#     await rpc_client.call(payload, "payment_queue")
+#     update_saga_state(order_id, "PAYMENT_REVERSED")
 
 
 @worker.register
@@ -402,6 +415,12 @@ async def process_payment_completed(data):
     try:
         saga_id = data.get("saga_id")
         order_id = data.get("order_id")
+        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, order_id, saga_id,
+                                                                             "process_payment_completed")
+
+        if check_idempotency_key(idempotency_key):
+            logger.info(f"[IDEMPOTENCY] Skipping duplicate payment step for {idempotency_key}")
+            return
 
         logger.info(f"[Order Orchestrator] Payment completed for saga={saga_id}, order={order_id}")
         update_saga_state(saga_id, "PAYMENT_COMPLETED")
@@ -458,7 +477,8 @@ async def process_payment_completed(data):
         }
         worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id,
                             action="checkout_completed", reply_to="gateway_queue")
-
+        response_data = {"status": "success", "step": "payment completed"}
+        response_data=global_idempotency.helper.store_idempotent_result(idempotency_key, response_data)
         return
 
     except Exception as e:
