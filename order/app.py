@@ -71,6 +71,62 @@ def enqueue_outbox_message(routing_key: str, payload:dict):
     except Exception as e:
         logger.error(f"Error while enqueueing message to outbox: {str(e)}")
 
+def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dict|None, details=None,):
+#retry maybe todo too with max attempts?
+
+    try:
+        saga_key = f"saga:{saga_id}"
+        saga_json = db_slave_saga.get(saga_key)
+        if saga_json:
+            saga_data = json.loads(saga_json)
+        else:
+            # Create a new saga record if not found
+            saga_data = {
+                "saga_id": saga_id,
+                "status": status,
+                "steps": [],
+                "created_at": time.time()
+            }
+
+        saga_data["status"] = status
+        saga_data["last_updated"] = time.time()
+
+        if details:
+            saga_data["details"] = {**saga_data.get("details", {}), **details}
+
+        # Append a step entry
+        saga_data["steps"].append({
+            "status": status,
+            "timestamp": time.time(),
+            "details": details
+        })
+
+        outbox_msg_json = None
+        if payload and routing_key:
+            message={
+                "routing_key":routing_key,
+                "payload":payload,
+                "timestamp":time.time()
+            }
+            outbox_msg_json = json.dumps(message)
+
+        with db_master_saga.pipeline() as pipe:
+            pipe.watch(saga_key)
+
+            pipe.set(saga_key, json.dumps(saga_data))
+            if outbox_msg_json:
+                pipe.rpush(OUTBOX_KEY,outbox_msg_json)
+            
+        result = pipe.execute()
+        
+        logger.info(f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox: {message}")
+        return True
+        
+    except redis.exceptions.RedisError as e:
+        logger.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
 
 def close_db_connection():
     logger.info("Closing DB connections")
@@ -79,6 +135,40 @@ def close_db_connection():
     db_master_saga.close()
     db_slave_saga.close()
 
+def update_saga_state(saga_id, status, details=None):
+    saga_key = f"saga:{saga_id}"
+    try:
+
+        saga_json = db_slave_saga.get(saga_key)
+
+        if saga_json:
+            saga_data = json.loads(saga_json)
+        else:
+            # Create a new saga record if not found
+            saga_data = {
+                "saga_id": saga_id,
+                "status": status,
+                "steps": [],
+                "created_at": time.time()
+            }
+
+        saga_data["status"] = status
+        saga_data["last_updated"] = time.time()
+
+        if details:
+            saga_data["details"] = {**saga_data.get("details", {}), **details}
+
+        # Append a step entry
+        saga_data["steps"].append({
+            "status": status,
+            "timestamp": time.time(),
+            "details": details
+        })
+
+        db_master_saga.set(saga_key, json.dumps(saga_data))
+        logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
+    except Exception as e:
+        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
 
 atexit.register(close_db_connection)
 
@@ -134,40 +224,7 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     return jsonify({"msg": "Batch init for orders successful"})
 
 
-def update_saga_state(saga_id, status, details=None):
-    saga_key = f"saga:{saga_id}"
-    try:
 
-        saga_json = db_slave_saga.get(saga_key)
-
-        if saga_json:
-            saga_data = json.loads(saga_json)
-        else:
-            # Create a new saga record if not found
-            saga_data = {
-                "saga_id": saga_id,
-                "status": status,
-                "steps": [],
-                "created_at": time.time()
-            }
-
-        saga_data["status"] = status
-        saga_data["last_updated"] = time.time()
-
-        if details:
-            saga_data["details"] = {**saga_data.get("details", {}), **details}
-
-        # Append a step entry
-        saga_data["steps"].append({
-            "status": status,
-            "timestamp": time.time(),
-            "details": details
-        })
-
-        db_master_saga.set(saga_key, json.dumps(saga_data))
-        logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
-    except Exception as e:
-        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
 
 
 def get_saga_state(saga_id: str) -> str:
@@ -351,16 +408,13 @@ async def process_stock_completed(data):
     except Exception as e:
         logger.error(f"Error in process_stock_completed: {str(e)}")
         if 'saga_id' in locals():
-            update_saga_state(saga_id, "PAYMENT_INITIATION_FAILED", {"error": str(e)})
+            # update_saga_state(saga_id, "PAYMENT_INITIATION_FAILED", {"error": str(e)})
             # Request stock compensation since we can’t proceed
             # await publish_event("stock.compensate", {
             #     "saga_id": saga_id,
             #     "order_id": order_id
             # })
-            enqueue_outbox_message("stock.compensate", {
-                "saga_id": saga_id,
-                "order_id": order_id
-            })
+            # enqueue_outbox_message("stock.compensate", )
             # Notify order of failure
             # await publish_event("order.checkout_failed", {
             #     "saga_id": saga_id,
@@ -368,6 +422,18 @@ async def process_stock_completed(data):
             #     "status": "failed",
             #     "error": str(e)
             # })
+            
+
+            #TODO: check updated
+            #combines the operations
+            update_saga_and_enqueue(
+                saga_id = saga_id,
+                status = "PAYMENT_INITIATION_FAILED",
+                details={"error": str(e)},
+                routing_key = "stock.compensate",
+                payload= {"saga_id": saga_id, "order_id": order_id}
+            )
+
             enqueue_outbox_message("order.checkout_failed", {
                 "saga_id": saga_id,
                 "order_id": order_id,
@@ -484,37 +550,72 @@ async def process_payment_completed(data):
     except Exception as e:
         logger.error(f"Error in process_payment_completed: {str(e)}")
         if 'saga_id' in locals():
-            update_saga_state(saga_id, "ORDER_FINALIZATION_FAILED", {"error": str(e)})
-            # # Compensate payment and stock
-            # await publish_event("payment.reverse", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id
-            # })
-            enqueue_outbox_message("payment.reverse",{
-                "saga_id": saga_id,
-                "order_id": order_id
-            })
-            # await publish_event("stock.compensate", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id
-            # })
-            enqueue_outbox_message("stock.compensate", {
-                "saga_id": saga_id,
-                "order_id": order_id
-            })
-            # # Notify failure
-            # await publish_event("order.checkout_failed", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id,
-            #     "status": "failed",
-            #     "error": str(e)
-            # })
-            enqueue_outbox_message("order.checkout_failed", {
+            
+            #TODO: check updated
+            #combines the operations
+            update_saga_and_enqueue(
+                saga_id = saga_id,
+                status = "ORDER_FINALIZATION_FAILED",
+                details={"error": str(e)},
+                routing_key = "payment.reverse",
+                payload= {"saga_id": saga_id, "order_id": order_id}
+            )
+
+            success = enqueue_outbox_message("order.checkout_failed", {
                 "saga_id": saga_id,
                 "order_id": order_id,
                 "status": "failed",
                 "error": str(e)
             })
+
+            if success:
+                enqueue_outbox_message("stock.compensate", {
+                    "saga_id": saga_id,
+                    "order_id": order_id
+                })
+                enqueue_outbox_message("order.checkout_failed", {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "status": "failed",
+                    "error": str(e)
+                })
+        
+            else:
+                logger.critical(f"Failed to enqueue outbox messages for saga {saga_id}")
+                
+
+            
+            # update_saga_state(saga_id, "ORDER_FINALIZATION_FAILED", {"error": str(e)})
+            # # # Compensate payment and stock
+            # # await publish_event("payment.reverse", {
+            # #     "saga_id": saga_id,
+            # #     "order_id": order_id
+            # # })
+            # enqueue_outbox_message("payment.reverse",{
+            #     "saga_id": saga_id,
+            #     "order_id": order_id
+            # })
+            # # await publish_event("stock.compensate", {
+            # #     "saga_id": saga_id,
+            # #     "order_id": order_id
+            # # })
+            # enqueue_outbox_message("stock.compensate", {
+            #     "saga_id": saga_id,
+            #     "order_id": order_id
+            # })
+            # # # Notify failure
+            # # await publish_event("order.checkout_failed", {
+            # #     "saga_id": saga_id,
+            # #     "order_id": order_id,
+            # #     "status": "failed",
+            # #     "error": str(e)
+            # # })
+            # enqueue_outbox_message("order.checkout_failed", {
+            #     "saga_id": saga_id,
+            #     "order_id": order_id,
+            #     "status": "failed",
+            #     "error": str(e)
+            # })
 
 
 async def process_failure_events(data):
@@ -522,6 +623,8 @@ async def process_failure_events(data):
     Any service can publish a failure event: e.g. 'stock.reservation_failed' or 'payment.failed'.
     The orchestrator listens, updates the saga state, and triggers compensation if needed.
     """
+
+    #TODO refactor for saga update and enqueue
     try:
         saga_id = data.get("saga_id")
         order_id = data.get("order_id")
@@ -832,37 +935,88 @@ async def recover_in_progress_sagas():
 
                     # Trigger compensation if needed
                     steps_completed = [step["status"] for step in saga_data.get("steps", [])]
-                    if "PAYMENT_COMPLETED" in steps_completed:
-                        # await publish_event("payment.reverse", {
-                        #     "saga_id": saga_id,
-                        #     "order_id": order_id
-                        # })
-                        enqueue_outbox_message("payment.reverse",{
-                            "saga_id": saga_id,
-                            "order_id": order_id
-                        })
-                    if "STOCK_RESERVATION_COMPLETED" in steps_completed:
-                        # await publish_event("stock.compensate", {
-                        #     "saga_id": saga_id,
-                        #     "order_id": order_id
-                        # })
-                        enqueue_outbox_message("stock.compensate",{
-                            "saga_id": saga_id,
-                            "order_id": order_id
-                        })
-                    # Notify that it failed
-                    await publish_event("order.checkout_failed", {
+
+                    comp_routing_key = None
+                    payload = {}
+                    other_compensations = []
+                    enqueue_outbox_message("order.checkout_failed", {
+                "saga_id": saga_id,
+                "order_id": order_id,
+                "status": "failed",
+                "error": str(e)
+            })
+                    
+            if "PAYMENT_COMPLETED" in steps_completed:
+                comp_routing_key = "payment.reverse"
+                payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id
+                }
+                if "STOCK_RESERVATION_COMPLETED" in steps_completed:
+                    other_compensations.append(("stock.compensate", {
                         "saga_id": saga_id,
-                        "order_id": order_id,
-                        "status": "failed",
-                        "error": "Timeout recovery triggered"
-                    })
-                    enqueue_outbox_message("order.checkout_failed",{
-                        "saga_id": saga_id,
-                        "order_id": order_id,
-                        "status": "failed",
-                        "error": "Timeout recovery triggered"
-                    })
+                        "order_id": order_id
+                    }))
+            
+            elif "STOCK_RESERVATION_COMPLETED" in steps_completed:
+                comp_routing_key = "stock.compensate"
+                payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id
+                }
+            
+            success = update_saga_and_enqueue(
+                saga_id = saga_id,
+                status = "SAGA_FAILED_RECOVERY",
+                details={"error": "Timeout recovery triggered"},
+                routing_key = comp_routing_key,
+                payload= payload, #potentially none
+            )
+
+            if success:
+                for key, payload in other_compensations:
+                    enqueue_outbox_message(key, payload)
+                
+                enqueue_outbox_message("order.checkout_failed", {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "status": "failed",
+                    "error": "Timeout recovery triggered"
+                })
+            else:
+                logger.critical(f"Failed to enqueue outbox messages for saga {saga_id}")
+                    
+                    # if "PAYMENT_COMPLETED" in steps_completed:
+                    #     # await publish_event("payment.reverse", {
+                    #     #     "saga_id": saga_id,
+                    #     #     "order_id": order_id
+                    #     # })
+                    #     enqueue_outbox_message("payment.reverse",{
+                    #         "saga_id": saga_id,
+                    #         "order_id": order_id
+                    #     })
+                    # elif "STOCK_RESERVATION_COMPLETED" in steps_completed:
+                    #     # await publish_event("stock.compensate", {
+                    #     #     "saga_id": saga_id,
+                    #     #     "order_id": order_id
+                    #     # })
+                    #     enqueue_outbox_message("stock.compensate",{
+                    #         "saga_id": saga_id,
+                    #         "order_id": order_id
+                    #     })
+                    # # Notify that it failed
+                    # await publish_event("order.checkout_failed", {
+                    #     "saga_id": saga_id,
+                    #     "order_id": order_id,
+                    #     "status": "failed",
+                    #     "error": "Timeout recovery triggered"
+                    # })
+                    # enqueue_outbox_message("order.checkout_failed",{
+                    #     "saga_id": saga_id,
+                    #     "order_id": order_id,
+                    #     "status": "failed",
+                    #     "error": "Timeout recovery triggered"
+                    # })
 
     except Exception as e:
         logger.error(f"Error recovering sagas: {str(e)}")
