@@ -292,8 +292,14 @@ async def pay(data):
             return ({"paid": False, "error": "Internal processing error"}, 500)
     
     except ValueError as e:
-        error_msg = str(e)
-        return ({"paid": False, "value error": error_msg}, 400)
+     error_msg = str(e)
+     if "insufficient credit" in error_msg.lower():
+         logging.warning(f"Caught insufficient credit ValueError for user {user_id}: {error_msg}")
+         return ({"paid": False, "error": "Insufficient credit"}, 400)
+     else:
+         logging.exception("Caught unexpected ValueError in pay")
+         return ({"paid": False, "error": f"Invalid value: {error_msg}"}, 400)
+
     except Exception as e:
         logging.exception("internal error")
         return ({"paid": False, "internal error": error_msg}, 400)

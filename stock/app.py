@@ -122,6 +122,8 @@ async def atomic_update_item(item_id: str, update_func):
 
         except redis.RedisError:
             return None, DB_ERROR_STR
+        except ValueError:
+            raise
         
         except Exception as e:
             logging.exception(f"Unexpected error in atomic_update_item for item {item_id}: {e}")
@@ -262,13 +264,16 @@ async def remove_stock(data):
             status_code = 404 if "not found" in error_msg.lower() else 500
             return {"error": f"Failed to cancel stock: {error_msg}"}, status_code
         if updated_item:
-            return {"refunded": True, "credit": updated_item.credit}, 200
+            return {"removed": True, "stock": updated_item.stock}, 200
         else:
             logging.error(f"Cancel stock failed for user {item_id}, unknown reason .")
             return {"error": "Failed stock cancellation, unknown reason"}, 500
+    except ValueError as e:
+        logging.warning(f"Insufficient stock for user {item_id}: {e}")
+        return {"error": f"Insufficient stock for user {item_id}: {e}"}, 400
     except Exception as e:
         logging.exception("Error canceling stock for user %s: %s", item_id, e)
-        return {"error": f"Error canceling stock for user {item_id}: {e}"}, 400
+        return {"error": f"Error canceling stock for user {item_id}: {e}"}, 500
         
 if __name__ == '__main__':
     asyncio.run(worker.start())
