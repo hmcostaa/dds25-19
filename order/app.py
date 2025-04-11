@@ -126,7 +126,7 @@ def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dic
         logger.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
         return False
     except Exception as e:
-        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
+        logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}")
 
 def close_db_connection():
     logger.info("Closing DB connections")
@@ -135,40 +135,40 @@ def close_db_connection():
     db_master_saga.close()
     db_slave_saga.close()
 
-def update_saga_state(saga_id, status, details=None):
-    saga_key = f"saga:{saga_id}"
-    try:
+# def update_saga_state(saga_id, status, details=None):
+#     saga_key = f"saga:{saga_id}"
+#     try:
 
-        saga_json = db_slave_saga.get(saga_key)
+#         saga_json = db_slave_saga.get(saga_key)
 
-        if saga_json:
-            saga_data = json.loads(saga_json)
-        else:
-            # Create a new saga record if not found
-            saga_data = {
-                "saga_id": saga_id,
-                "status": status,
-                "steps": [],
-                "created_at": time.time()
-            }
+#         if saga_json:
+#             saga_data = json.loads(saga_json)
+#         else:
+#             # Create a new saga record if not found
+#             saga_data = {
+#                 "saga_id": saga_id,
+#                 "status": status,
+#                 "steps": [],
+#                 "created_at": time.time()
+#             }
 
-        saga_data["status"] = status
-        saga_data["last_updated"] = time.time()
+#         saga_data["status"] = status
+#         saga_data["last_updated"] = time.time()
 
-        if details:
-            saga_data["details"] = {**saga_data.get("details", {}), **details}
+#         if details:
+#             saga_data["details"] = {**saga_data.get("details", {}), **details}
 
-        # Append a step entry
-        saga_data["steps"].append({
-            "status": status,
-            "timestamp": time.time(),
-            "details": details
-        })
+#         # Append a step entry
+#         saga_data["steps"].append({
+#             "status": status,
+#             "timestamp": time.time(),
+#             "details": details
+#         })
 
-        db_master_saga.set(saga_key, json.dumps(saga_data))
-        logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
-    except Exception as e:
-        logger.error(f"Error updating saga state {saga_id} to {status.value}: {str(e)}")
+#         db_master_saga.set(saga_key, json.dumps(saga_data))
+#         logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
+#     except Exception as e:
+#         logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}")
 
 atexit.register(close_db_connection)
 
@@ -258,7 +258,8 @@ async def create_order(data):
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db_master.set(key, value)
-        update_saga_state(key, "INITIATED")
+        # update_saga_state(key, "INITIATED")
+        update_saga_and_enqueue(saga_id=key, status="INITIATED", routing_key=None, payload=None)
     except redis.exceptions.RedisError:
         return DB_ERROR_STR, 400
     return {"order_id": key}, 200
@@ -300,11 +301,18 @@ async def process_checkout_request(data, message):
         response_data = {"status": "success", "step": "checkout"}
         global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
         # Initialize saga state
-        update_saga_state(saga_id, "SAGA_STARTED", {
-            "order_id": order_id,
-            "initiated_at": time.time()
-        })
+        # update_saga_state(saga_id, "SAGA_STARTED", {
+        #     "order_id": order_id,
+        #     "initiated_at": time.time()
+        # })
 
+        update_saga_and_enqueue(
+            saga_id,
+            status="SAGA_STARTED",
+            routing_key=None,
+            payload=None,
+        )
+        
         # order_data = await find_order(order_id)
         # Prepare the payload for the stock service
         order_data = await rpc_client.call({
@@ -317,20 +325,36 @@ async def process_checkout_request(data, message):
         # Lock order to prevent concurrent processing
         # order_lock_value = acquire_write_lock(order_id)
         order_lock_value = await rpc_client.call({
-            "type": "acquire_write_lock",
+            "type": "acquire_write_lock", #where was this relased??
             "data": {
                 "order_id": order_id
             }
         }, "order_queue")
 
-        update_saga_state(saga_id, "ORDER_LOCK_REQUESTED", order_data)
+        # update_saga_state(saga_id, "ORDER_LOCK_REQUESTED", order_data)
+
+        update_saga_and_enqueue(
+            saga_id=saga_id,
+            status="ORDER_LOCK_REQUESTED",
+            details=order_data,
+            routing_key=None,
+            payload=None,
+        )
+
+        
         if order_lock_value is None:
             raise Exception("Order is already being processed")
         logger.info(f"[Order Orchestrator] Lock acquired {order_lock_value} for order {order_id}")
-        update_saga_state(saga_id, "ORDER_LOCKED", {
-            "order_id": order_id,
-            "lock_value": order_lock_value
-        })
+        # update_saga_state(saga_id, "ORDER_LOCKED", {
+        #     "order_id": order_id,
+        #     "lock_value": order_lock_value
+        # })
+
+        update_saga_and_enqueue(saga_id=saga_id,
+                                status="ORDER_LOCKED",
+                                details={"order_id": order_id, "lock_value": order_lock_value},
+                                routing_key=None,
+                                payload=None)
 
         # Step 1: Publish stock reserve so the Stock Service can reserve items
         logger.info(f"[Order Orchestrator] Sending reserve stock message for saga={saga_id}, order={order_id}")
@@ -349,15 +373,31 @@ async def process_checkout_request(data, message):
         logger.error(f"Error in process_checkout_request: {str(e)}")
         if 'saga_id' in locals():
             # Mark the saga as failed
-            update_saga_state(saga_id, "SAGA_FAILED_INITIALIZATION", {"error": str(e)})
+            # update_saga_state(saga_id, "SAGA_FAILED_INITIALIZATION", {"error": str(e)})
+
+            update_saga_and_enqueue(
+                saga_id=saga_id,
+                status="SAGA_FAILED_INITIALIZATION",
+                details={"error": str(e)},
+                routing_key=None,
+                payload=None,
+            )
+
             # Notify order of failure
-            await publish_event("order.checkout_failed", {
+            # await publish_event("order.checkout_failed", {
+            #     "saga_id": saga_id,
+            #     "order_id": order_id,
+            #     "status": "failed",
+            #     "error": str(e)
+            # })
+            
+            #outbox instead of enqueue
+            enqueue_outbox_message("order.checkout_failed", {
                 "saga_id": saga_id,
                 "order_id": order_id,
                 "status": "failed",
                 "error": str(e)
             })
-
 
 @worker.register
 async def process_stock_completed(data):
@@ -376,7 +416,14 @@ async def process_stock_completed(data):
             return
 
         logger.info(f"[Order Orchestrator] Stock reservation completed for saga={saga_id}, order={order_id}")
-        update_saga_state(saga_id, "STOCK_RESERVATION_COMPLETED")
+        # update_saga_state(saga_id, "STOCK_RESERVATION_COMPLETED")
+
+        update_saga_and_enqueue(
+            saga_id=saga_id,
+            status="STOCK_RESERVATION_COMPLETED",
+            details=None,
+            routing_key=None,
+        )
 
         # Retrieve saga state to get user_id, total_cost, etc.
         saga_data = get_saga_state(saga_id)
@@ -396,7 +443,15 @@ async def process_stock_completed(data):
             "user_id": user_id,
             "amount": total_cost
         }
-        update_saga_state(saga_id, "PAYMENT_INITIATED")
+        # update_saga_state(saga_id, "PAYMENT_INITIATED")
+
+        update_saga_and_enqueue(
+            saga_id=saga_id,
+            status="PAYMENT_INITIATED",
+            details=None,
+            routing_key="payment_queue",
+            payload=payload,
+        )
         # TODO: Probably only the last message should have a callback_action???
         worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
                             action="remove_credit", reply_to="orchestrator_queue",
@@ -489,7 +544,14 @@ async def process_payment_completed(data):
             return
 
         logger.info(f"[Order Orchestrator] Payment completed for saga={saga_id}, order={order_id}")
-        update_saga_state(saga_id, "PAYMENT_COMPLETED")
+        # update_saga_state(saga_id, "PAYMENT_COMPLETED")
+        update_saga_and_enqueue(
+            saga_id=saga_id,
+            status="PAYMENT_COMPLETED",
+            details=None,
+            routing_key=None,
+            payload=None,
+        )
 
         # Step 3: Finalize the order in your Order Service by removing the previusly reserved items
         # order_data = await find_order(order_id)
@@ -506,7 +568,13 @@ async def process_payment_completed(data):
             }
             worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="remove_stock")
         logger.info(f"[Order Orchestrator] Stock removed successfully for saga={saga_id}, order={order_id}")
-        update_saga_state(saga_id, "STOCK_REMOVED")
+        # update_saga_state(saga_id, "STOCK_REMOVED")
+        update_saga_and_enqueue(
+            saga_id,
+            "STOCK_REMOVED",
+            routing_key=None,
+            payload=None,
+        )
 
         # Retrieve saga state to get user_id, total_cost, etc.
         saga_data = get_saga_state(saga_id)
@@ -528,13 +596,32 @@ async def process_payment_completed(data):
             }
         }, "order_queue")
         if order_released:
-            update_saga_state(saga_id, "ORDER_LOCK_RELEASED")
+            # update_saga_state(saga_id, "ORDER_LOCK_RELEASED")
+            update_saga_and_enqueue(
+                saga_id,
+                "ORDER_LOCK_RELEASED",
+                routing_key=None,
+                payload=None,
+            )
         else:
             raise Exception(f"Failed to release lock for order {order_id}")
 
-        update_saga_state(saga_id, "ORDER_FINALIZED")
-        update_saga_state(saga_id, "SAGA_COMPLETED", {"completed_at": time.time()})
+        # update_saga_state(saga_id, "ORDER_FINALIZED")
+        # update_saga_state(saga_id, "SAGA_COMPLETED", {"completed_at": time.time()})
 
+        update_saga_and_enqueue(
+            saga_id,
+            "ORDER_FINALIZED",
+            routing_key=None,
+            payload=None,
+        )
+        update_saga_and_enqueue(
+            saga_id,
+            "SAGA_COMPLETED",
+            details={"completed_at": time.time()},
+            routing_key=None,
+            payload=None,
+        )
         # Notify success
         payload = {
             "saga_id": saga_id,
@@ -553,7 +640,7 @@ async def process_payment_completed(data):
             
             #TODO: check updated
             #combines the operations
-            update_saga_and_enqueue(
+            success = update_saga_and_enqueue(
                 saga_id = saga_id,
                 status = "ORDER_FINALIZATION_FAILED",
                 details={"error": str(e)},
@@ -561,12 +648,12 @@ async def process_payment_completed(data):
                 payload= {"saga_id": saga_id, "order_id": order_id}
             )
 
-            success = enqueue_outbox_message("order.checkout_failed", {
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "status": "failed",
-                "error": str(e)
-            })
+            # success = enqueue_outbox_message("order.checkout_failed", {
+            #     "saga_id": saga_id,
+            #     "order_id": order_id,
+            #     "status": "failed",
+            #     "error": str(e)
+            # })
 
             if success:
                 enqueue_outbox_message("stock.compensate", {
@@ -630,10 +717,10 @@ async def process_failure_events(data, message):
         order_id = data.get("order_id")
         # TODO: Extract error message from the event
         error = data.get('error', 'Unknown error')
-        routing_key = data.routing_key
+        # routing_key = data.routing_key
 
         #using gettatr to default to UNKOWN
-        routing_key = getattr
+        routing_key = getattr(message, 'routing_key', "UNKNOWN")
 
         logger.info(f"[Order Orchestrator] Failure event {routing_key} for saga={saga_id}: {error}")
         
@@ -705,7 +792,7 @@ async def process_failure_events(data, message):
         else:
             logger.critical(f"[Order Orchestrator] Failed to update saga {saga_id} to {status}")
             await message.nack(requeue=True)
-            
+
         # # Publish compensation events in reverse order
         # for comp_key, payload in compensations:
         #     await publish_event(comp_key, payload)
@@ -732,6 +819,10 @@ async def process_failure_events(data, message):
 
     except Exception as e:
         logger.error(f"Error in process_failure_events: {str(e)}")
+        try:
+            await message.nack(requeue=True)
+        except Exception as e:
+            logger.error(f"Error nacking message: {str(e)}")
 
 
 # ----------------------------------------------------------------------------
@@ -770,7 +861,7 @@ def send_post_request(url: str):
         return response
 
 
-
+#TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
 @worker.register
 async def add_item(data):
     order_id = data.get("order_id")
@@ -804,7 +895,14 @@ async def add_item(data):
     # Save the updated order back to the database
     try:
         db_master.set(order_id, msgpack.encode(order_entry))
-        update_saga_state(order_id, "ITEM_ADDED")
+        # update_saga_state(order_id, "ITEM_ADDED")
+        update_saga_and_enqueue(
+            saga_id=order_id,
+            status="ITEM_ADDED",
+            routing_key=None,
+            payload=None,
+        )
+        #enqueue outbox??
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
 
@@ -835,7 +933,11 @@ def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
                     "lock_value": lock_value
                 }
             )
+        
+            #TODO, check if correct? lock timeout wasnt impelemented??
+            db_master.expire(f"lock_meta:{lock_key}", int(lock_timeout / 1000) + 60)
             return lock_value
+    
         else:
             logger.info(f"Lock already acquired for order: {order_id}")
             return None
@@ -878,6 +980,7 @@ def release_write_lock(order_id: str, lock_value: str) -> bool:
 
 
 # Forcibly release abandoned locks
+# was unused
 def force_release_locks(order_id: str) -> bool:
     lock_key = f"write_lock:order:{order_id}"
     meta_key = f"lock_meta:{lock_key}"
@@ -982,9 +1085,9 @@ async def recover_in_progress_sagas():
                     order_id = saga_data.get("details", {}).get("order_id")
                     logger.warning(f"[Order Orchestrator] Found stuck saga={saga_id}, forcing fail.")
 
-                    update_saga_state(saga_id, "SAGA_FAILED_RECOVERY", {
-                        "error": "Timeout recovery triggered"
-                    })
+                    # update_saga_state(saga_id, "SAGA_FAILED_RECOVERY", {
+                    #     "error": "Timeout recovery triggered"
+                    # })
 
                     # Trigger compensation if needed
                     steps_completed = [step["status"] for step in saga_data.get("steps", [])]
@@ -992,52 +1095,52 @@ async def recover_in_progress_sagas():
                     comp_routing_key = None
                     payload = {}
                     other_compensations = []
-                    enqueue_outbox_message("order.checkout_failed", {
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "status": "failed",
-                "error": str(e)
-            })
+            #         enqueue_outbox_message("order.checkout_failed", {
+            #     "saga_id": saga_id,
+            #     "order_id": order_id,
+            #     "status": "failed",
+            #     "error": str(e)
+            # })
                     
-            if "PAYMENT_COMPLETED" in steps_completed:
-                comp_routing_key = "payment.reverse"
-                payload = {
-                    "saga_id": saga_id,
-                    "order_id": order_id
-                }
-                if "STOCK_RESERVATION_COMPLETED" in steps_completed:
-                    other_compensations.append(("stock.compensate", {
-                        "saga_id": saga_id,
-                        "order_id": order_id
-                    }))
-            
-            elif "STOCK_RESERVATION_COMPLETED" in steps_completed:
-                comp_routing_key = "stock.compensate"
-                payload = {
-                    "saga_id": saga_id,
-                    "order_id": order_id
-                }
-            
-            success = update_saga_and_enqueue(
-                saga_id = saga_id,
-                status = "SAGA_FAILED_RECOVERY",
-                details={"error": "Timeout recovery triggered"},
-                routing_key = comp_routing_key,
-                payload= payload, #potentially none
-            )
+                    if "PAYMENT_COMPLETED" in steps_completed:
+                        comp_routing_key = "payment.reverse"
+                        payload = {
+                            "saga_id": saga_id,
+                            "order_id": order_id
+                        }
+                        if "STOCK_RESERVATION_COMPLETED" in steps_completed:
+                            other_compensations.append(("stock.compensate", {
+                                "saga_id": saga_id,
+                                "order_id": order_id
+                            }))
+                    
+                    elif "STOCK_RESERVATION_COMPLETED" in steps_completed:
+                        comp_routing_key = "stock.compensate"
+                        payload = {
+                            "saga_id": saga_id,
+                            "order_id": order_id
+                        }
+                    
+                    success = update_saga_and_enqueue(
+                        saga_id = saga_id,
+                        status = "SAGA_FAILED_RECOVERY",
+                        details={"error": "Timeout recovery triggered"},
+                        routing_key = comp_routing_key,
+                        payload= payload, #potentially none
+                    )
 
-            if success:
-                for key, payload in other_compensations:
-                    enqueue_outbox_message(key, payload)
-                
-                enqueue_outbox_message("order.checkout_failed", {
-                    "saga_id": saga_id,
-                    "order_id": order_id,
-                    "status": "failed",
-                    "error": "Timeout recovery triggered"
-                })
-            else:
-                logger.critical(f"Failed to enqueue outbox messages for saga {saga_id}")
+                    if success:
+                        for key, payload in other_compensations:
+                            enqueue_outbox_message(key, payload)
+                        
+                        enqueue_outbox_message("order.checkout_failed", {
+                            "saga_id": saga_id,
+                            "order_id": order_id,
+                            "status": "failed",
+                            "error": "Timeout recovery triggered"
+                        })
+                    else:
+                        logger.critical(f"Failed to enqueue outbox messages for saga {saga_id}")
                     
                     # if "PAYMENT_COMPLETED" in steps_completed:
                     #     # await publish_event("payment.reverse", {
@@ -1121,7 +1224,11 @@ async def consume_messages():
 async def outbox_poller():
     while True:
         try:
-            raw=db_master_saga.loop(OUTBOX_KEY)
+            #blpop instead of loop
+            #TODO what if message loss between LOP and succesfull AMQP publish???
+
+            raw=db_master_saga.blpop(OUTBOX_KEY,timeout=5)
+
             if not raw:
                 await asyncio.sleep(1)
                 continue
