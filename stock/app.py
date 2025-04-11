@@ -64,7 +64,6 @@ class StockValue(Struct):
     stock: int
     price: int
 
-
 def get_item_from_db(item_id: str) -> StockValue | None:
     # get serialized data
     try:

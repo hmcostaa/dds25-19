@@ -18,14 +18,6 @@ import logging
 from global_idempotency.idempotency_decorator import idempotent
 
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
-# from global_idempotency.app import (
-#         IdempotencyStoreConnectionError,
-#         IdempotencyDataError,
-#         check_idempotent_operation,
-#         store_idempotent_result,
-#         IdempotencyResultTuple
-#     )
-
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)s: %(message)s"
@@ -94,8 +86,7 @@ def get_user_from_db(user_id: str) -> Optional[UserValue]:
 
 async def atomic_update_user(user_id: str, update_func):
     #retry? backoff/?
-    #for attempts i tn range(max_retries):
-    
+    #for attempts i tn range(max_retries): 
     max_retries = 5
     base_backoff = 50 
 

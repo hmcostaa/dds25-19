@@ -47,30 +47,6 @@ except redis.ConnectionError as e:
     # Don't raise exception here - just log it, so service can still start
     # and attempt to reconnect later
 
-#? moved to each service
-
-# def generate_idempotency_key(service_name:str,operation_type:str,resource_id: str,request_id:str=None)->str:
-#     """
-#         Generate a globally unique idempotent key that includes service information.
-
-#         Parameters:
-#         - service_name: Name of the service (e.g., 'order', 'payment', 'stock')
-#         - operation_type: Type of operation (e.g., 'create', 'update', 'reservation')
-#         - resource_id: ID of the resource being operated on (e.g., order_id)
-#         - request_id: Optional client-provided request ID
-
-#         Returns:
-#         - A string key in the format 'idempotent:{service}:{operation}:{resource}:{request_id or hash}'
-#         """
-#     if request_id:
-#         return f"idempotent:{service_name}:{operation_type}:{resource_id}:{request_id}"
-#     else:
-
-#         # hash_content = f"{service_name}:{operation_type}:{resource_id}:{time.time()}"
-#         hash_value=hashlib.sha256(hash_content.encode()).hexdigest()
-#         return f"idempotent:{service_name}:{operation_type}:{resource_id}:{hash_value}"
-
-#need status code, solely a dict loses the status code
 IdempotencyResultTuple = Tuple[Dict[str, Any], int]
 
     
@@ -140,7 +116,7 @@ def store_idempotent_result(
     except Exception as e:
         logger.error(f"Error storing idempotency result: {str(e)}")
         return False
-    
+   
 # def clear_idempotent_key_for_order(resource_id: str)->int:
 #     """
 #         Clear all idempotency keys associated with a specific resource.
