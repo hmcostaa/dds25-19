@@ -1,6 +1,7 @@
 import logging
 import os
 import atexit
+import time
 import uuid
 import asyncio
 import random
@@ -21,14 +22,6 @@ logging.basicConfig(
 )
 
 logging = logging.getLogger("stock-service")
-
-# from global_idempotency.app import (
-#         IdempotencyStoreConnectionError,
-#         IdempotencyDataError,
-#         check_idempotent_operation,
-#         store_idempotent_result,
-#         IdempotencyResultTuple
-#     )
 
 SERVICE_NAME = "stock"
 
@@ -253,9 +246,6 @@ async def remove_stock(data):
         item.stock -= int(amount)
         return item
     
-    updated_item = None
-    error_msg = None
-
     try:
         updated_item, error_msg = await atomic_update_item(item_id, updater)
         if error_msg:

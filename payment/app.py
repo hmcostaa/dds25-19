@@ -51,6 +51,7 @@ sentinel = Sentinel([
 db_master = sentinel.master_for('payment-master', socket_timeout=0.1, decode_responses=False)
 db_slave = sentinel.slave_for('payment-master', socket_timeout=0.1, decode_responses=False)
 
+
 logging.info("Connected to Redis Sentinel.")
 
 #no slave since idempotency is critical to payment service
@@ -202,6 +203,7 @@ async def find_user(data):
         abort(400, f"Error retrieving user: {e}")
 
 @worker.register
+@idempotent('add_funds', idempotency_db_conn, SERVICE_NAME)
 async def add_funds(data):
     user_id =  require_user_id(data)
     amount = int(data.get("amount", 0))
@@ -283,7 +285,6 @@ async def pay(data):
             return ({"paid": False, "error": "Internal processing error"}, 500)
     
     except ValueError as e:
-     error_msg = str(e)
      if "insufficient credit" in error_msg.lower():
          logging.warning(f"Caught insufficient credit ValueError for user {user_id}: {error_msg}")
          return ({"paid": False, "error": "Insufficient credit"}, 400)
@@ -295,9 +296,35 @@ async def pay(data):
         logging.exception("internal error")
         return ({"paid": False, "internal error": error_msg}, 400)
     
+    
+    
 @worker.register
-@idempotent('cancel_payment', idempotency_db_conn, SERVICE_NAME)
-async def cancel_payment(data):
+async def remove_credit(data):
+    user_id = data.get("user_id")
+    amount = int(data.get("amount", 0))
+
+    if not user_id or amount <= 0:
+        return {"error": "Invalid request"}, 400
+
+    def updater(user: UserValue) -> UserValue:
+        if user.credit < amount:
+            raise ValueError("Insufficient funds")
+        user.credit -= amount
+        return user
+
+    updated_user, error_msg = await atomic_update_user(user_id, updater)
+
+    if error_msg:
+        return {"error": error_msg}, 400
+    return {"msg": f"Removed {amount} from user {user_id}"}, 200
+
+
+
+
+
+@worker.register
+@idempotent('compensate', idempotency_db_conn, SERVICE_NAME)
+async def compensate(data):
     try:
         user_id = data.get("user_id")
         order_id = data.get("order_id") 
@@ -337,3 +364,62 @@ if __name__ == '__main__':
     logging.info("Starting payment service AMQP worker...")
     asyncio.run(worker.start())
 
+# @worker.register
+# async def reverse(data):
+#     user_id = data.get("user_id")
+#     amount = int(data.get("amount", 0))
+
+#     if not user_id or amount <= 0:
+#         return {"error": "Invalid reverse amount"}, 400
+
+#     def updater(user: UserValue) -> UserValue:
+#         user.credit += amount
+#         return user
+
+#     updated_user, error_msg = await atomic_update_user(user_id, updater)
+
+#     if error_msg:
+#         return {"error": error_msg}, 400
+#     return {"msg": f"Refunded {amount} to user {user_id}"}, 200
+# @worker.register
+# @idempotent('cancel_payment', idempotency_db_conn, SERVICE_NAME)
+# async def cancel_payment(data):
+#     try:
+#         user_id = data.get("user_id")
+#         order_id = data.get("order_id") 
+#         attempt_id = data.get("attempt_id")
+#         amount = data.get("amount")
+
+#         if not all([user_id, amount is not None]):
+#             logging.error("Missing user_id or amount in cancel_payment request.")
+#             return {"error": "Missing required fields"}, 400
+        
+#         if int(amount) <= 0:
+#             return {"error": "Transaction amount must be positive"}, 400
+        
+#     except (ValueError, TypeError):
+#         return {"error": "Invalid amount specified"}, 400
+    
+#     def updater(user: UserValue) -> UserValue:
+#         user.credit += amount
+#         return user
+    
+#     try:
+#         updated_user, error_msg = await atomic_update_user(user_id, updater)
+#         if error_msg:
+#             logging.error(f"Failed to cancel payment (refund) for user {user_id}: {error_msg}")
+#             status_code = 404 if "not found" in error_msg.lower() else 500
+#             return {"error": f"Failed to cancel payment: {error_msg}"}, status_code
+#         if updated_user:
+#             return {"refunded": True, "credit": updated_user.credit}, 200
+#         else:
+#             logging.error(f"Cancel payment failed for user {user_id}, unknown reason .")
+#             return {"error": "Failed cancellation, unknown reason"}, 500
+#     except Exception as e:
+#         logging.exception("Error canceling payment for user %s: %s", user_id, e)
+#         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
+    
+# if __name__ == '__main__':
+#     logging.info("Starting payment service AMQP worker...")
+#     asyncio.run(worker.start())
+# 

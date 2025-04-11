@@ -20,7 +20,13 @@ class RpcClient:
     async def connect(self, url: str) -> "RpcClient":
         self.connection = await connect_robust(url)
         self.channel = await self.connection.channel()
-        self.callback_queue = await self.channel.declare_queue(exclusive=True, durable=True)
+        queue_arguments={
+            "x-dead-letter-exchange": "dead-letter-exchange",
+            "x-dead-letter-routing-key": "dead_letter"
+        }
+        self.callback_queue = await self.channel.declare_queue(name='',
+            exclusive=True,
+            durable=True, arguments=queue_arguments)
         await self.callback_queue.consume(self.on_response, no_ack=True)
 
         return self
@@ -52,3 +58,9 @@ class RpcClient:
         )
 
         return await future
+
+    async def call_stock(self, action: str, data: dict):
+        return await self.call("stock_queue", action, data)
+
+    async def call_payment(self, action: str, data: dict):
+        return await self.call("payment_queue", action, data)

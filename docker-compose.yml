@@ -274,9 +274,9 @@ services:
 
   # ------------------------- Order Service & Orchestrator -----------------------------------
   order-orchestrator:
-    build: 
+    build:
       context: .
-      dockerfile: order/order-orchestrator/Dockerfile
+      dockerfile: order-orchestrator/Dockerfile
     image: order-orchestrator:latest
     environment:
       - AMQP_URL=amqp://user:password@rabbitmq:5672/
@@ -341,24 +341,30 @@ services:
       - ./global_idempotency:/usr/src/app/global_idempotency
     # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
-      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+      AMQP_URL: "amqp://rabbitmq"
       SAGA_REDIS_HOST: redis-saga-master
       SAGA_REDIS_PORT: 6379
       SAGA_REDIS_PASSWORD: redis
       SAGA_REDIS_DB: 1
+
+    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+
     env_file:
       - env/stock_redis.env
     networks:
       - redis-cluster-network
     depends_on:
+      rabbitmq:
+        condition: service_healthy
+      stock-db:
+        condition: service_started
       redis-stock-master:
          condition: service_healthy
       redis-saga-master:
         condition: service_healthy
       redis-sentinel-1:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s
