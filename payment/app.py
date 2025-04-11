@@ -2,8 +2,10 @@ import logging
 import os
 import atexit
 import sys
+import sys
 import uuid
 import asyncio
+from redis import Sentinel
 from redis import Sentinel
 import redis
 
@@ -59,7 +61,7 @@ logging.info("Connected to Redis Sentinel.")
 #no slave since idempotency is critical to payment service
 idempotency_db_conn = db_master 
 
-logging.info("Connected to idempotency Redis.")
+logging.info("Connected to idempotency (Payment) Redis.")
 
 
 def close_db_connection():
@@ -74,7 +76,6 @@ atexit.register(close_db_connection)
 class UserValue(Struct):
     credit: int
 
-
 def get_user_from_db(user_id: str) -> Optional[UserValue]:
     try:
         # get serialized data
@@ -87,9 +88,6 @@ def get_user_from_db(user_id: str) -> Optional[UserValue]:
         # if user does not exist in the database; abort
         abort(400, f"User: {user_id} not found!")
     return entry
-##CHECK idempotency
-##STORE idempotency
-# order_id = data.get("order_id") # Used for idempotency key
 
 async def atomic_update_user(user_id: str, update_func):
     #retry? backoff/?
@@ -160,6 +158,7 @@ async def atomic_update_user(user_id: str, update_func):
             return None, "Internal data error"
             
     return None, f"Failed to update user, retries nr??."
+
 # For testing, had endpoint "user_id" couldnt be found using POSTMAN
 def require_user_id(data):
     uid = data.get("user_id")
@@ -241,10 +240,6 @@ async def add_funds(data):
 
 @worker.register
 async def pay(data):
-
-    # user_id, error = require_user_id(data)
-    # if error:
-    #     return error
     user_id = data.get("user_id")
     order_id = data.get("order_id")
     amount = int(data.get("amount", 0))
@@ -260,96 +255,101 @@ async def pay(data):
     except (ValueError, TypeError):
         logging.error("Unexpected error, amount:.", amount)
         return {"error": "Invalid amount?"}, 400
-    
-    idempotency_key = f"idempotent:{SERVICE_NAME}:pay:{user_id}:{order_id}:{attempt_id}"
-    idempotency_utf8 = idempotency_key.encode('utf-8')
-    # stored_result = check_idempotency(idempotency_key, idempotency_db_conn)
-    # if stored_result is not None:
-    #     logging.info(f"PAY: Duplicate attempt {attempt_id}. Returning stored result.")
-    #     return stored_result
 
-    try:
-        stored = check_idempotent_operation(idempotency_utf8, idempotency_db_conn) #awaitt
-        if stored is not None:
-            try:
-                if stored is not None:
-                    return stored
-            except MsgspecDecodeError:
-                logging.error("keeps on happening... %s: %s", idempotency_key, e)  
-                return {"error": "idempotency data error"}, 500
-    except IdempotencyStoreConnectionError as e:
-        return {"error": "Idempotency service unavailable"}, 503
-    except IdempotencyDataError as e: 
-        return {"error": "Idempotency data error"}, 500
-    except Exception as e:
-        logging.error("keeps on happening... %s: %s", idempotency_key, e)
-        return {"error": "Idempotency service error"}, 500 
+    if order_id and attempt_id: 
+        idempotency_key = f"idempotent:{SERVICE_NAME}:pay:{user_id}:{order_id}:{attempt_id}"
+        idempotency_utf8 = idempotency_key.encode('utf-8')
+        # stored_result = check_idempotency(idempotency_key, idempotency_db_conn)
+        # if stored_result is not None:
+        #     logging.info(f"PAY: Duplicate attempt {attempt_id}. Returning stored result.")
+        #     return stored_result
 
-    def updater(user: UserValue) -> UserValue:
-        if user.credit < int(amount):
-            raise ValueError(f"User {user_id} has insufficient credit")
-        user.credit -= int(amount)
-        return user
-
-    # updated_user, error_msg, res_tuple = None, None, None
-    updated_user = None
-    error_msg = None
-    res = None
-
-    try: 
-        updated_user, error_msg = await atomic_update_user(user_id, updater) 
-    except ValueError as e:
-        error_msg = str(e)
-        logging.warning(f"'pay' logic failed: {e}")
-    except Exception as e:
-        logging.exception("internal error")
-        error_msg = str(e)
-
-    
-    if error_msg:
-        logging.error(f"'pay' logic failed: {error_msg}")
-        logging.debug(f"error_msg: {error_msg}")
-        if "insufficient credit" in error_msg.lower():
-            status_code = 400 
-        elif "not found" in error_msg.lower(): 
-            status_code = 404
-        else: 
-            status_code = 500
-        res = ({"paid": False, "error": error_msg}, status_code)
         try:
-            store_idempotent_result(idempotency_key, res, idempotency_db_conn)
+            stored = check_idempotent_operation(idempotency_utf8, idempotency_db_conn) #awaitt
+            if stored is not None:
+                try:
+                    if stored is not None:
+                        return stored
+                except MsgspecDecodeError as e:
+                    logging.error("keeps on happening... %s: %s", idempotency_key, e)  
+                    return {"error": "idempotency data error"}, 500
+        except IdempotencyStoreConnectionError as e:
+            return {"error": "Idempotency service unavailable"}, 503
+        except IdempotencyDataError as e: 
+            return {"error": "Idempotency data error"}, 500
         except Exception as e:
-            logging.error(f"failure to store failure result ={idempotency_key}: {e}")
-        return res
+            logging.error("keeps on happening... %s: %s", idempotency_key, e)
+            return {"error": "Idempotency service error"}, 500 
+
+        def updater(user: UserValue) -> UserValue:
+            if user.credit < int(amount):
+                raise ValueError(f"User {user_id} has insufficient credit")
+            user.credit -= int(amount)
+            return user
+
+        # updated_user, error_msg, res_tuple = None, None, None
+        updated_user = None
+        error_msg = None
+        res = None
+
+        try: 
+            updated_user, error_msg = await atomic_update_user(user_id, updater) 
+        except ValueError as e:
+            error_msg = str(e)
+            logging.warning(f"'pay' logic failed: {e}")
+        except Exception as e:
+            logging.exception("internal error")
+            error_msg = str(e)
+
         
-    elif updated_user:
-        
-        logging.info(f" 'pay' logic succeeded: New credit: {updated_user.credit}")
-        res= ({"paid": True, "credit": updated_user.credit}, 200)
-    
-        try:
-            was_set = store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-            if not was_set:
-                # Race condition
-                logging.warning(f"Idempotency key {idempotency_key} already existed or failed to set (race condition likely lost).")
-                # decide? Raise error for NACK or allow ACK? raising is safer???  state-wise? TODO
-        except (IdempotencyDataError, IdempotencyStoreConnectionError) as e:
-            logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
-            # operation finished, but failed to record its state
-            # replay if the caller retreis?? for now just return res, with logging, not worryyish
+        if error_msg:
+            logging.error(f"'pay' logic failed: {error_msg}")
+            logging.debug(f"error_msg: {error_msg}")
+            if "insufficient credit" in error_msg.lower():
+                status_code = 400 
+            elif "not found" in error_msg.lower(): 
+                status_code = 404
+            else: 
+                status_code = 500
+            res = ({"paid": False, "error": error_msg}, status_code)
+            
+            if order_id and attempt_id:
+                try:
+                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
+                except Exception as e:
+                    logging.error(f"failure to store failure result ={idempotency_key}: {e}")
+                return res
+            
+        elif updated_user:
+            
+            logging.info(f" 'pay' logic succeeded: New credit: {updated_user.credit}")
+            res= ({"paid": True, "credit": updated_user.credit}, 200)
 
-        except Exception as e:
-            logging.critical("FAILED TO STORE ::", idempotency_key, e)
-            # prevent auto-ACK. Manual intervention |0|
-        return res
-    else:
-        #fallback
-        res = ({"paid": False, "error": "Internal processing error"}, 500)
-        try:
-            store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-        except Exception as e:
-            logging.error(f"Failed to store idempotency result,unkown {idempotency_key}: {e}")
-        return res
+            if order_id and attempt_id:
+                try:
+                    was_set = store_idempotent_result(idempotency_key, res, idempotency_db_conn)
+                    if not was_set:
+                        # Race condition
+                        logging.warning(f"Idempotency key {idempotency_key} already existed or failed to set (race condition likely lost).")
+                        # decide? Raise error for NACK or allow ACK? raising is safer???  state-wise? TODO
+                except (IdempotencyDataError, IdempotencyStoreConnectionError) as e:
+                    logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
+                    # operation finished, but failed to record its state
+                    # replay if the caller retreis?? for now just return res, with logging, not worryyish
+
+                except Exception as e:
+                    logging.critical("FAILED TO STORE ::", idempotency_key, e)
+                    # prevent auto-ACK. Manual intervention |0|
+            return res
+        else:
+            #fallback
+            res = ({"paid": False, "error": "Internal processing error"}, 500)
+            if order_id and attempt_id:
+                try:
+                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
+                except Exception as e:
+                    logging.error(f"Failed to store idempotency result,unkown {idempotency_key}: {e}")
+            return res
     
     
 
