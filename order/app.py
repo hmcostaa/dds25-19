@@ -618,7 +618,7 @@ async def process_payment_completed(data):
             # })
 
 
-async def process_failure_events(data):
+async def process_failure_events(data, message):
     """
     Any service can publish a failure event: e.g. 'stock.reservation_failed' or 'payment.failed'.
     The orchestrator listens, updates the saga state, and triggers compensation if needed.
@@ -632,13 +632,24 @@ async def process_failure_events(data):
         error = data.get('error', 'Unknown error')
         routing_key = data.routing_key
 
+        #using gettatr to default to UNKOWN
+        routing_key = getattr
+
         logger.info(f"[Order Orchestrator] Failure event {routing_key} for saga={saga_id}: {error}")
-        update_saga_state(saga_id, f"FAILURE_EVENT_{routing_key.upper()}", {"error": error})
+        
+        # update_saga_state(saga_id, f"FAILURE_EVENT_{routing_key.upper()}", {"error": error})
 
         saga_data = get_saga_state(saga_id)
         if not saga_data:
             logger.error(f"[Order Orchestrator] Saga {saga_id} not found.")
-            # await message.ack()
+            await message.ack()
+            return
+        
+        #check whether saga already failed or completed
+        current_status = saga_data.get("status")
+        if current_status in ["SAGA_COMPLETED", "SAGA_FAILED", "SAGA_FAILED_RECOVERY"]:
+            logger.warning(f"[Order Orchestrator] Saga {saga_id} already terminated ({current_status}). Ignoring failure event {routing_key}.")
+            await message.ack() # Acknowledge, saga already finished
             return
 
         # Check which steps were completed
@@ -646,36 +657,78 @@ async def process_failure_events(data):
         compensations = []
 
         # If payment was completed but we got a failure from somewhere else, reverse it
-        if "PAYMENT_COMPLETED" in steps_completed and routing_key != "payment.failed":
+        if "PAYMENT_COMPLETED" in steps_completed and routing_key:
             compensations.append(("payment.reverse", {"saga_id": saga_id, "order_id": order_id}))
 
         # If stock was reserved but we have a new failure (not from stock reservation itself), roll it back
-        if "STOCK_RESERVATION_COMPLETED" in steps_completed and routing_key != "stock.reservation_failed":
+        if "STOCK_RESERVATION_COMPLETED" in steps_completed and routing_key:
             compensations.append(("stock.compensate", {"saga_id": saga_id, "order_id": order_id}))
 
-        # Publish compensation events in reverse order
-        for comp_key, payload in compensations:
-            await publish_event(comp_key, payload)
 
-        update_saga_state(saga_id, "SAGA_FAILED", {
+        #final failure
+        compensations.append(("order.checkout_failed", {
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "status": "failed",
+            "error": error
+        }))
+
+        status = "SAGA_FAILED"
+        details = {
             "error": error,
-            "compensations_initiated": [c[0] for c in compensations],
+            "compensations_initiated": [c[0] for c in compensations if c[0] != "order.checkout_failed"],
             "failed_at": time.time()
-        })
+        }
+        routing_key = None
+        payload = None
+        remaining_msgs = []
 
-        # Notify that checkout failed
-        await publish_event("order.checkout_failed", {
-            "saga_id": saga_id,
-            "order_id": order_id,
-            "status": "failed",
-            "error": error
-        })
-        enqueue_outbox_message("order.checkout_failed",{
-            "saga_id": saga_id,
-            "order_id": order_id,
-            "status": "failed",
-            "error": error
-        })
+        if compensations:
+            # Gather routing keys and payload for first message
+            routing_key = compensations[0][0]
+            payload = compensations[0][1]
+            remaining_msgs = compensations[1:]
+        
+        success = update_saga_and_enqueue(
+            saga_id=saga_id,
+            status=status,
+            details=details,
+            routing_key=routing_key,
+            payload=payload,
+        )
+        if success:
+            logger.info(f"[Order Orchestrator] Successfully updated saga {saga_id} to {status}")
+            for comp_key, payload in compensations:
+                enqueue_outbox_message(comp_key, payload)
+            
+            await message.ack()
+        else:
+            logger.critical(f"[Order Orchestrator] Failed to update saga {saga_id} to {status}")
+            await message.nack(requeue=True)
+            
+        # # Publish compensation events in reverse order
+        # for comp_key, payload in compensations:
+        #     await publish_event(comp_key, payload)
+
+        # update_saga_state(saga_id, "SAGA_FAILED", {
+        #     "error": error,
+        #     "compensations_initiated": [c[0] for c in compensations],
+        #     "failed_at": time.time()
+        # })
+
+        # # Notify that checkout failed
+        # await publish_event("order.checkout_failed", {
+        #     "saga_id": saga_id,
+        #     "order_id": order_id,
+        #     "status": "failed",
+        #     "error": error
+        # })
+        # enqueue_outbox_message("order.checkout_failed",{
+        #     "saga_id": saga_id,
+        #     "order_id": order_id,
+        #     "status": "failed",
+        #     "error": error
+        # })
 
     except Exception as e:
         logger.error(f"Error in process_failure_events: {str(e)}")
