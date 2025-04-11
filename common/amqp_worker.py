@@ -3,6 +3,8 @@ import logging
 import uuid
 import asyncio
 import inspect
+import redis
+from global_idempotency.app import IdempotencyStoreConnectionError
 from aio_pika import Message, connect_robust, DeliveryMode
 from aio_pika.abc import (
     AbstractChannel, AbstractConnection,
@@ -27,9 +29,9 @@ class AMQPWorker:
         self.queue_name = queue_name
         self.callbacks = {}
         # self._use_manual_acks = use_manual_acks # possibility to use manual acks, still testing
-        self._use_manual_acks = use_manual_acks
+        # self._use_manual_acks = use_manual_acks
         logger.info(f"AMQPWorker queue name: '{queue_name}'")
-        logger.info(f"AMQPWorker queue name: '{queue_name}' Manual ACKs: {use_manual_acks}")
+        # logger.info(f"AMQPWorker queue name: '{queue_name}' Manual ACKs: {use_manual_acks}")
 
     def register(self, callback):
         """
@@ -47,12 +49,13 @@ class AMQPWorker:
 
     #decooupled reply
     async def _handle_reply(self, message: AbstractIncomingMessage, response):
+        correlation_id = message.correlation_id or str(uuid.uuid4())
         if message.reply_to and response is not None:
             try:
-                await self.channel.publish(
+                await self.channel.default_exchange.publish(
                     Message(
                         body=json.dumps(response).encode(),
-                        correlation_id=message.correlation_id,
+                        correlation_id=correlation_id,
                         delivery_mode= DeliveryMode.PERSISTENT #persistent replies
                     ),
                     routing_key=message.reply_to,
@@ -72,7 +75,7 @@ class AMQPWorker:
 
             dlx_name = f"{self.queue_name}.dlx"
             dlq_name = f"{self.queue_name}.dlq"
-            dlq_routing_key = "dead_letter_queue"
+            dlq_routing_key = dlq_name
 
             await self.channel.declare_exchange(
                 dlx_name,
@@ -80,17 +83,24 @@ class AMQPWorker:
                 durable=True,
             )
 
-            dead_letter_queue = await self.channel.declare_queue(
+            await self.channel.declare_queue(
                 dlq_name,
                 durable=True,
             )
 
             logger.info(f"Declared DLX '{dlx_name}' and DLQ '{dlq_name}'")
 
+            await self.channel.queue.bind(
+                queue = dlq_name,
+                exchange = dlx_name,
+                routing_key = dlq_routing_key
+            )
+            
             main_queue_arguments = {
                 "x-dead-letter-exchange": dlx_name,
-                "x-dead-letter-routing-key": dlq_name
+                "x-dead-letter-routing-key": dlq_routing_key
             }
+            
 
             queue = await self.channel.declare_queue(
                 self.queue_name,
@@ -100,11 +110,11 @@ class AMQPWorker:
 
             logger.info(f"Declared queue '{self.queue_name}' linked to DLX '{dlx_name}'")
             
-            #manual ack
-            if self._use_manual_acks:
-                await queue.consume(self.on_message, no_ack=False)
-                logger.info(" [*] Waiting for messages. To exit press CTRL+C")
-                await asyncio.Future()
+            # #manual ack
+            # if self._use_manual_acks:
+            await queue.consume(self.on_message, no_ack=False)
+            logger.info(" [*] Waiting for messages. To exit press CTRL+C")
+            await asyncio.Future()
 
 
     async def on_message(self, message:AbstractIncomingMessage):
@@ -116,59 +126,87 @@ class AMQPWorker:
         handler = None
         message_type = None
         processed_successfully = False
+        ack_status = "pending"
 
         try:
             data = json.loads(message.body.decode())
             message_type = message.type
             logger.debug(f" Received message type='{message_type}', DeliveryTag={message.delivery_tag}")
 
-            if message_type in self.callbacks:
+            if not message_type in self.callbacks:
+                ack_status = "nacked_dlq"
+                return
+            try:
                 handler = self.callbacks[message_type]
                 logger.debug(f"calling handler '{handler.__name__}'")
                 # call handler with (data, message) 
                 response_tuple = await handler(data, message)
 
                 processed_successfully = True
+                logger.info("Reply processed successfully")
 
-                await self._handle_reply(message, response_tuple)
-
-            else:
-                logger.warning(f" No callback registered for '{message_type}'. Rejecting message (permanently, since there is no handler). Dont Requeue")
-                await message.reject(requeue=False)
-                return
-
-        except json.JSONDecodeError:
-            logger.exception("Error in message  inJSONDecodeError")
-            try:
-                await message.nack(requeue=False)
+            except (redis.RedisError, asyncio.TimeoutError, IdempotencyStoreConnectionError, ConnectionError) as e:
+                logger.warning(f"Transient error DeliveryTag={message.delivery_tag} Error={str(e)}")
+                ack_status = "nacked_dlq"
+            
             except Exception as e:
-                logger.exception("Error nacking message JSONDECODE")
-            return
+                logger.error(f"Fatal error DeliveryTag={message.delivery_tag} Error={str(e)}")
+                ack_status = "nacked_dlq"
+                #potential rpc timeout custom rpc timeout
+                #transient errors
+
+        # except json.JSONDecodeError as e:
+        #     logger.error(f"JSONDecodeError DeliveryTag={message.delivery_tag} Error={str(e)}")
+        #     requeue = False
+        # except Exception as e:
+        #     logger.exception("Error in message processing loop DeliverTag=%s", message.delivery_tag)
+        #     requeue = False
+
+        #     #retry/DlQ TODO
+        #     #potentially requeue for some errors??
+        #     #for now --> just assume processing error -> no requeue
+
+        #     # try:
+        #     #     await message.nack(should_requeue)
+        #     #     logger.info("Message nacked DeliverTag=%s", message.delivery_tag)
+        #     # except Exception as e:
+        #     #     logger.exception("Error nacking message UNKNOWN")
+        #     # return
+        # try:
+            if processed_successfully:
+                try:
+                    await self._handle_reply(message, response_tuple)
+                    logger.info("Message processed successfully")
+                except Exception as e:
+                    logger.error(f"Error handling reply for message {message.correlation_id}: {str(e)}")
         
         except Exception as e:
-            logger.exception("Error in message processing loop DeliverTag=%s", message.delivery_tag)
+            logger.critical("unexpected critical error, DeliverTag=%s", message.delivery_tag)
 
-            #retry/DlQ TODO
-            #potentially requeue for some errors??
-            #for now --> just assume processing error -> no requeue
+        finally:
+            try:
+                if ack_status == "pending":
+                    if processed_successfully:
+                        await message.ack()
+                        ack_status = "acked"
+                        logger.debug("Message acked DeliverTag=%s", message.delivery_tag)
+                    else:
+                        logger.warning("finally: Message processing failed, DeliverTag=%s", message.delivery_tag)
+                        await message.nack(requeue=True)
+                        ack_status = "nacked_dlq"
 
-            should_requeue = False
-            try:
-                await message.nack(should_requeue)
-                logger.info("Message nacked DeliverTag=%s", message.delivery_tag)
+                elif ack_status == "nacked_dlq":
+                    await message.nack(requeue=False)
+                    logger.debug("Message nacked DeliverTag=%s", message.delivery_tag)
+
+                elif ack_status == "acked":
+                    pass
+
             except Exception as e:
-                logger.exception("Error nacking message UNKNOWN")
-            return
-        
-        if processed_successfully:
-            try:
-                await message.ack()
-                logger.info("Message acked DeliverTag=%s", message.delivery_tag)
-            except Exception as e:
-                #processing succceeded, but ack failed
-                #idempotency is important here
-                logger.exception("Error acking message, processing succceeded but ack failed, DeliverTag=%s", message.delivery_tag)
-        
+                #failed to ack/nack after processing, TERRIBLE
+
+                logger.critical(f"Error acking message, processing succceeded but ack failed, DeliverTag={message.delivery_tag}")
+
         #not necessary because of the deadletter queue
         # else:
         #     #processing failed, weird case, since exceptions are handled above
@@ -199,7 +237,7 @@ class AMQPWorker:
 
         correlation_id = correlation_id or str(uuid.uuid4())
 
-        await exchange.publish(
+        await exchange.default_exchange.publish(
             Message(
                 body=json.dumps(payload).encode(),
                 correlation_id=correlation_id,

@@ -338,6 +338,7 @@ services:
     image: stock:latest
     volumes:
       - ./common:/usr/src/app/stock/common
+      - ./global_idempotency:/usr/src/app/global_idempotency
     # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
@@ -377,11 +378,6 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: redis
       REDIS_DB: 0
-
-      IDEMPOTENCY_REDIS_HOST: redis-payment-master 
-      IDEMPOTENCY_REDIS_PORT: 6379
-      IDEMPOTENCY_REDIS_PASSWORD: redis
-      IDEMPOTENCY_REDIS_DB: 0 
 
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
       SAGA_REDIS_HOST: redis-saga-master
