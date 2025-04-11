@@ -11,6 +11,7 @@ from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeEr
 from flask import Flask, jsonify, abort, Response
 from redis import Sentinel
 
+from global_idempotency.idempotency_decorator import idempotent
 
 DB_ERROR_STR = "DB error"
 
@@ -21,13 +22,13 @@ logging.basicConfig(
 
 logging = logging.getLogger("stock-service")
 
-from global_idempotency.app import (
-        IdempotencyStoreConnectionError,
-        IdempotencyDataError,
-        check_idempotent_operation,
-        store_idempotent_result,
-        IdempotencyResultTuple
-    )
+# from global_idempotency.app import (
+#         IdempotencyStoreConnectionError,
+#         IdempotencyDataError,
+#         check_idempotent_operation,
+#         store_idempotent_result,
+#         IdempotencyResultTuple
+#     )
 
 SERVICE_NAME = "stock"
 
@@ -42,8 +43,8 @@ sentinel= Sentinel([
     (os.environ['REDIS_SENTINEL_2'],26380),
     (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
 
-db_master=sentinel.master_for('stock-master', socket_timeout=0.1, decode_responses=True)
-db_slave=sentinel.slave_for('stock-master', socket_timeout=0.1, decode_responses=True)
+db_master=sentinel.master_for('stock-master', socket_timeout=0.1, decode_responses=False)
+db_slave=sentinel.slave_for('stock-master', socket_timeout=0.1, decode_responses=False)
 
 #no slave since idempotency is critical to payment service
 idempotency_db_conn = db_master 
@@ -174,6 +175,7 @@ async def find_item(data):
             "price": item_entry.price } , 200
 
 @worker.register
+@idempotent('add_stock', idempotency_db_conn, SERVICE_NAME)
 async def add_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
@@ -191,44 +193,17 @@ async def add_stock(data):
         logging.error("Unexpected error, amount:.", amount)
         return {"error": "Invalid amount?"}, 400
     
-    if order_id and attempt_id:
-        idempotency_key = f"idempotent:{SERVICE_NAME}:add:{item_id}:{order_id}:{attempt_id}"
-        idempotency_utf8 = idempotency_key.encode('utf-8')
+    
+    def updater(item: StockValue) -> StockValue:
+        item.stock += amount_int
+        return item
+    
+    updated_item = None
+    error_msg = None
 
-        try:
-            stored = check_idempotent_operation(idempotency_utf8, idempotency_db_conn) #awaitt
-            if stored is not None:
-                try:
-                    if stored is not None:
-                        return stored
-                except MsgspecDecodeError as e:
-                    logging.error("keeps on happening... %s: %s", idempotency_key, e)  
-                    return {"error": "idempotency data error"}, 500
-        except IdempotencyStoreConnectionError as e:
-            return {"error": "Idempotency service unavailable"}, 503
-        except IdempotencyDataError as e: 
-            return {"error": "Idempotency data error"}, 500
-        except Exception as e:
-            logging.error("keeps on happening... %s: %s", idempotency_key, e)
-            return {"error": "Idempotency service error"}, 500 
-
-        def updater(item: StockValue) -> StockValue:
-            item.stock += amount_int
-            return item
-        
-        updated_item = None
-        error_msg = None
-        res = None
-
-        try:
-            updated_item, error_msg = await atomic_update_item(item_id, updater)
-        except ValueError as e:
-            error_msg = str(e)
-            logging.warning(f"'pay' logic failed: {e}")
-        except Exception as e:
-            logging.exception("internal error")
-            error_msg = str(e)
-
+    try:
+        updated_item, error_msg = await atomic_update_item(item_id, updater)
+    
         if error_msg:
             logging.error(f"'add_stock' logic failed: {error_msg}")
             logging.debug(f"error_msg: {error_msg}")
@@ -236,62 +211,64 @@ async def add_stock(data):
                 status_code = 404
             else: 
                 status_code = 500
-            res = ({"added": False, "error": error_msg}, status_code)
-            
-            if order_id and attempt_id:
-                try:
-                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                except Exception as e:
-                    logging.error(f"failure to store failure result ={idempotency_key}: {e}")
-                return res
+            return ({"added": False, "error": error_msg}, status_code)
             
         elif updated_item:
             logging.info(f"Item: {item_id} stock updated to: {updated_item.stock}")
-            res = ({"added": True, "stock": updated_item.stock}, 200)
+            return ({"added": True, "stock": updated_item.stock}, 200)
 
-            if order_id and attempt_id:
-                try:
-                    was_set = store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                    if not was_set:
-                        # Race condition
-                        logging.warning(f"Idempotency key {idempotency_key} already existed or failed to set (race condition likely lost).")
-                except (IdempotencyDataError, IdempotencyStoreConnectionError) as e:
-                    logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
-                except Exception as e:
-                    logging.critical("FAILED TO STORE ::", idempotency_key, e)
-                    # prevent auto-ACK. Manual intervention |0|
-            return res
         else:
             #fallback
-            res = ({"added": False, "error": "Internal processing error"}, 500)
-            # Store result for idempotency if we have order_id and attempt_id
-            if order_id and attempt_id:
-                try:
-                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                except Exception as e:
-                    logging.error(f"Failed to store idempotency result, unknown {idempotency_key}: {e}")
-            return res
+            return ({"added": False, "error": "Internal processing error"}, 500)
+        
+    except ValueError as e:
+        error_msg = str(e)
+        return ({"paid": False, "value error": error_msg}, 400)
+    except Exception as e:
+        logging.exception("internal error")
+        return ({"paid": False, "internal error": error_msg}, 400)
 
 @worker.register
+@idempotent('remove_stock', idempotency_db_conn, SERVICE_NAME)
 async def remove_stock(data):
     item_id = data.get("item_id")
     amount = data.get("amount")
 
-    def stock_value_change2(item: StockValue) -> StockValue:
-        if item.stock - int(amount) < 0:
-            return None, 400
+    if not all([item_id, amount is not None]):
+        logging.error("Missing item_id or amount in remove_stock request.")
+        return {"error": "Missing required fields"}, 400
+        
+    try:
+        if int(amount) <= 0:
+            return {"error": "Transaction amount must be positive"}, 400
+        
+    except (ValueError, TypeError):
+        return {"error": "Invalid amount specified"}, 400
+    
+    def updater(item: StockValue) -> StockValue:
+        if item.stock < int(amount):
+            # Raise ValueError for insufficient stock
+            raise ValueError(f"Insufficient stock for item {item_id} (available: {item.stock}, requested: {int(amount)})")
         item.stock -= int(amount)
-        return item, 200
-    response, response_code = atomic_update_item(item_id,stock_value_change2)
-    if response_code == 400:
-        return response, 400
+        return item
+    
+    updated_item = None
+    error_msg = None
 
-    updated_item, response_code = get_item_from_db(item_id)
-    if response_code == 400:
-        return DB_ERROR_STR, 400
-    return {
-            "UpdatedStock": updated_item.stock
-            }, 200
-
+    try:
+        updated_item, error_msg = await atomic_update_item(item_id, updater)
+        if error_msg:
+            logging.error(f"Failed to cancel stock (refund) for user {item_id}: {error_msg}")
+            status_code = 404 if "not found" in error_msg.lower() else 500
+            return {"error": f"Failed to cancel stock: {error_msg}"}, status_code
+        if updated_item:
+            return {"refunded": True, "credit": updated_item.credit}, 200
+        else:
+            logging.error(f"Cancel stock failed for user {item_id}, unknown reason .")
+            return {"error": "Failed stock cancellation, unknown reason"}, 500
+    except Exception as e:
+        logging.exception("Error canceling stock for user %s: %s", item_id, e)
+        return {"error": f"Error canceling stock for user {item_id}: {e}"}, 400
+        
 if __name__ == '__main__':
     asyncio.run(worker.start())

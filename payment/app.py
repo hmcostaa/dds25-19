@@ -10,18 +10,21 @@ from redis import Sentinel
 import redis
 
 from flask import Flask, jsonify, abort, Response
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from redis.exceptions import WatchError, RedisError
 import random
 import logging
+
+from global_idempotency.idempotency_decorator import idempotent
+
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
-from global_idempotency.app import (
-        IdempotencyStoreConnectionError,
-        IdempotencyDataError,
-        check_idempotent_operation,
-        store_idempotent_result,
-        IdempotencyResultTuple
-    )
+# from global_idempotency.app import (
+#         IdempotencyStoreConnectionError,
+#         IdempotencyDataError,
+#         check_idempotent_operation,
+#         store_idempotent_result,
+#         IdempotencyResultTuple
+#     )
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -239,6 +242,7 @@ async def add_funds(data):
         return {"error": "Unexpected error, add funds"}, 500
 
 @worker.register
+@idempotent('pay', idempotency_db_conn, SERVICE_NAME)
 async def pay(data):
     user_id = data.get("user_id")
     order_id = data.get("order_id")
@@ -256,52 +260,19 @@ async def pay(data):
         logging.error("Unexpected error, amount:.", amount)
         return {"error": "Invalid amount?"}, 400
 
-    if order_id and attempt_id: 
-        idempotency_key = f"idempotent:{SERVICE_NAME}:pay:{user_id}:{order_id}:{attempt_id}"
-        idempotency_utf8 = idempotency_key.encode('utf-8')
-        # stored_result = check_idempotency(idempotency_key, idempotency_db_conn)
-        # if stored_result is not None:
-        #     logging.info(f"PAY: Duplicate attempt {attempt_id}. Returning stored result.")
-        #     return stored_result
+    def updater(user: UserValue) -> UserValue:
+        if user.credit < int(amount):
+            raise ValueError(f"User {user_id} has insufficient credit")
+        user.credit -= int(amount)
+        return user
 
-        try:
-            stored = check_idempotent_operation(idempotency_utf8, idempotency_db_conn) #awaitt
-            if stored is not None:
-                try:
-                    if stored is not None:
-                        return stored
-                except MsgspecDecodeError as e:
-                    logging.error("keeps on happening... %s: %s", idempotency_key, e)  
-                    return {"error": "idempotency data error"}, 500
-        except IdempotencyStoreConnectionError as e:
-            return {"error": "Idempotency service unavailable"}, 503
-        except IdempotencyDataError as e: 
-            return {"error": "Idempotency data error"}, 500
-        except Exception as e:
-            logging.error("keeps on happening... %s: %s", idempotency_key, e)
-            return {"error": "Idempotency service error"}, 500 
+    # updated_user, error_msg, res_tuple = None, None, None
+    updated_user = None
+    error_msg = None
 
-        def updater(user: UserValue) -> UserValue:
-            if user.credit < int(amount):
-                raise ValueError(f"User {user_id} has insufficient credit")
-            user.credit -= int(amount)
-            return user
+    try: 
+        updated_user, error_msg = await atomic_update_user(user_id, updater) 
 
-        # updated_user, error_msg, res_tuple = None, None, None
-        updated_user = None
-        error_msg = None
-        res = None
-
-        try: 
-            updated_user, error_msg = await atomic_update_user(user_id, updater) 
-        except ValueError as e:
-            error_msg = str(e)
-            logging.warning(f"'pay' logic failed: {e}")
-        except Exception as e:
-            logging.exception("internal error")
-            error_msg = str(e)
-
-        
         if error_msg:
             logging.error(f"'pay' logic failed: {error_msg}")
             logging.debug(f"error_msg: {error_msg}")
@@ -311,78 +282,52 @@ async def pay(data):
                 status_code = 404
             else: 
                 status_code = 500
-            res = ({"paid": False, "error": error_msg}, status_code)
-            
-            if order_id and attempt_id:
-                try:
-                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                except Exception as e:
-                    logging.error(f"failure to store failure result ={idempotency_key}: {e}")
-                return res
+            return ({"paid": False, "error": error_msg}, status_code)
             
         elif updated_user:
-            
             logging.info(f" 'pay' logic succeeded: New credit: {updated_user.credit}")
-            res= ({"paid": True, "credit": updated_user.credit}, 200)
-
-            if order_id and attempt_id:
-                try:
-                    was_set = store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                    if not was_set:
-                        # Race condition
-                        logging.warning(f"Idempotency key {idempotency_key} already existed or failed to set (race condition likely lost).")
-                        # decide? Raise error for NACK or allow ACK? raising is safer???  state-wise? TODO
-                except (IdempotencyDataError, IdempotencyStoreConnectionError) as e:
-                    logging.critical(f"FAILED TO STORE idempotency result for key {idempotency_key}: {e}")
-                    # operation finished, but failed to record its state
-                    # replay if the caller retreis?? for now just return res, with logging, not worryyish
-
-                except Exception as e:
-                    logging.critical("FAILED TO STORE ::", idempotency_key, e)
-                    # prevent auto-ACK. Manual intervention |0|
-            return res
+            return ({"paid": True, "credit": updated_user.credit}, 200)
         else:
             #fallback
-            res = ({"paid": False, "error": "Internal processing error"}, 500)
-            if order_id and attempt_id:
-                try:
-                    store_idempotent_result(idempotency_key, res, idempotency_db_conn)
-                except Exception as e:
-                    logging.error(f"Failed to store idempotency result,unkown {idempotency_key}: {e}")
-            return res
+            return ({"paid": False, "error": "Internal processing error"}, 500)
     
+    except ValueError as e:
+        error_msg = str(e)
+        return ({"paid": False, "value error": error_msg}, 400)
+    except Exception as e:
+        logging.exception("internal error")
+        return ({"paid": False, "internal error": error_msg}, 400)
     
-
-
 @worker.register
+@idempotent('cancel_payment', idempotency_db_conn, SERVICE_NAME)
 async def cancel_payment(data):
     try:
         user_id = data.get("user_id")
-        amount = int(data.get("amount", 0))
+        order_id = data.get("order_id") 
+        attempt_id = data.get("attempt_id")
+        amount = data.get("amount")
 
         if not all([user_id, amount is not None]):
             logging.error("Missing user_id or amount in cancel_payment request.")
             return {"error": "Missing required fields"}, 400
         
-        if amount <= 0:
+        if int(amount) <= 0:
             return {"error": "Transaction amount must be positive"}, 400
+        
     except (ValueError, TypeError):
         return {"error": "Invalid amount specified"}, 400
     
-
     def updater(user: UserValue) -> UserValue:
         user.credit += amount
         return user
+    
     try:
         updated_user, error_msg = await atomic_update_user(user_id, updater)
-
         if error_msg:
             logging.error(f"Failed to cancel payment (refund) for user {user_id}: {error_msg}")
             status_code = 404 if "not found" in error_msg.lower() else 500
             return {"error": f"Failed to cancel payment: {error_msg}"}, status_code
         if updated_user:
-        # return {"refunded": True, "credi 200
-        # return Response(f"User: {user_id} credit updated to: {updated_user.credit}", status=200)
             return {"refunded": True, "credit": updated_user.credit}, 200
         else:
             logging.error(f"Cancel payment failed for user {user_id}, unknown reason .")
