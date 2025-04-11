@@ -1,5 +1,5 @@
 import os
-from quart import Quart
+from quart import Quart, jsonify
 from rpc_client import RpcClient
 
 app = Quart(__name__)
@@ -78,8 +78,6 @@ async def find_item(item_id):
         "data": {
             "item_id": item_id
         }
-        "item_id": item_id,
-        "amount": amount
     }
     response, code = await rpc_client.call(queue="stock_queue",
                                            action="remove_stock",
@@ -102,10 +100,27 @@ async def add_stock_item(item_id, amount):
 
 @app.route("/stock/create_item/<price>")
 async def create_item(price):
-    response, code = await rpc_client.call(queue="stock_queue",
-                                           action="create_item",
-                                           payload={"price": price})
-    return response, code
+    payload = {"price": price}
+    try:
+        # Corrected call using positional arguments: payload, queue
+        response_data = await rpc_client.call(payload, "stock_queue")
+
+        # Check if response_data is actually what you expect (e.g., a dictionary)
+        # The stock service returns {'item_id': key} on success
+        if isinstance(response_data, dict) and 'item_id' in response_data:
+             # Return the successful JSON response with a 200 OK status
+            return jsonify(response_data), 200
+        else:
+             # Handle cases where RPC succeeded but returned unexpected data
+            app.logger.error(f"RPC call for create_item returned unexpected data: {response_data}")
+            return jsonify({"error": "Received unexpected data from stock service"}), 500
+
+    except Exception as e:
+        # Catch potential errors during the RPC call
+        # (e.g., if RpcClient raised an error due to non-JSON reply from stock service on error)
+        app.logger.error(f"RPC call failed for create_item: {e}")
+        # Return an error JSON response
+        return jsonify({"error": "RPC call to stock service failed"}), 500
 
 @app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
 async def batch_init(n,starting_stock,item_price):
@@ -149,7 +164,7 @@ async def add_stock(item_id, amount):
     return response
 
 # The following routes are used to interact with the payment service
-@app.route("/payment/create_user")
+@app.route(("/payment/create_user"), methods=["POST"])
 async def create_user():
     response, code = await rpc_client.call(queue="payment_queue",
                                            action="create_user")

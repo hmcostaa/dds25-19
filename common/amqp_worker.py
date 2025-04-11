@@ -77,24 +77,20 @@ class AMQPWorker:
             dlq_name = f"{self.queue_name}.dlq"
             dlq_routing_key = dlq_name
 
-            await self.channel.declare_exchange(
+            dlx = await self.channel.declare_exchange(
                 dlx_name,
                 type="direct",
                 durable=True,
             )
 
-            await self.channel.declare_queue(
+            dlq = await self.channel.declare_queue(
                 dlq_name,
                 durable=True,
             )
 
             logger.info(f"Declared DLX '{dlx_name}' and DLQ '{dlq_name}'")
 
-            await self.channel.queue.bind(
-                queue = dlq_name,
-                exchange = dlx_name,
-                routing_key = dlq_routing_key
-            )
+            await dlq.bind(exchange=dlx, routing_key=dlq_routing_key)
             
             main_queue_arguments = {
                 "x-dead-letter-exchange": dlx_name,

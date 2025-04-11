@@ -14,6 +14,7 @@ from aio_pika import connect_robust, Message, DeliveryMode
 import global_idempotency
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
+import global_idempotency.helper
 from redis import Sentinel
 
 import redis
@@ -42,8 +43,8 @@ app = Flask("order-service")
 
 sentinel = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
-    (os.environ['REDIS_SENTINEL_2'], 26380),
-    (os.environ['REDIS_SENTINEL_3'], 26381)], socket_timeout=0.1, password=os.environ['REDIS_PASSWORD'])
+    (os.environ['REDIS_SENTINEL_2'], 26379),
+    (os.environ['REDIS_SENTINEL_3'], 26379)], socket_timeout=0.1, password=os.environ['REDIS_PASSWORD'])
 
 db_master = sentinel.master_for('order-master', socket_timeout=0.1, decode_responses=True)
 db_slave = sentinel.slave_for('order-master', socket_timeout=0.1, decode_responses=True)
@@ -290,7 +291,8 @@ async def process_checkout_request(data, message):
         attempt_id = str(message.delivery_tag) if message else str(uuid.uuid4())
         logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}, . Saga ID: {saga_id}")
 
-        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),order_id,saga_id)
+        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, data.get("user_id"), order_id, attempt_id) 
+        # idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),order_id,saga_id)
         try:
             if check_idempotency_key(idempotency_key):
                app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
@@ -408,6 +410,7 @@ async def process_stock_completed(data):
     try:
         saga_id = data.get('saga_id')
         order_id = data.get('order_id')
+        
         idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, order_id, saga_id,
                                                                              "process_stock_completed")
 
@@ -869,6 +872,21 @@ async def add_item(data):
     quantity = data.get("quantity")
     order_entry: OrderValue = get_order_from_db(order_id)
 
+    idempotency_key = f"idempotent:{SERVICE_NAME}:add_item:{order_id}:{item_id}:{quantity}" 
+
+    try:
+        if global_idempotency.helper.check_idempotency_key(idempotency_key):
+            logger.info(f"[IDEMPOTENCY] Duplicate add_item request for key {idempotency_key}. Skipping.")
+            order_entry: OrderValue = get_order_from_db(order_id)
+            if order_entry:
+                 return {"msg": f"Item: {item_id} potentially already added to order: {order_id}. Current cost: {order_entry.total_cost}"}, 200
+            else:
+                 return {"msg": f"Item: {item_id} potentially already added. Order {order_id} not found?"}, 404 
+
+    except global_idempotency.helper.IdempotencyStoreConnectionError as e:
+         logger.error(f"Idempotency check failed for add_item {idempotency_key}: {e}")
+         return {"error": "Idempotency check failed"}, 500
+
     # Prepare the payload for the stock service
     payload = {
         "type": "find_item",  # Message type for the stock service
@@ -903,6 +921,13 @@ async def add_item(data):
             payload=None,
         )
         #enqueue outbox??
+        try:
+            global_idempotency.helper.store_idempotent_result(idempotency_key, {"status": "item_added"})
+            logger.info(f"[IDEMPOTENCY] Stored result for add_item key {idempotency_key}")
+        except Exception as ie:
+             logger.error(f"Failed to store idempotency key {idempotency_key} after add_item: {ie}")
+             # operation succeeded-> however idempotency might fail on retry if key wasn't stored.
+
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
 
