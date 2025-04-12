@@ -52,7 +52,7 @@ app = Flask("order-service")
 sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
     (os.environ['REDIS_SENTINEL_2'], 26379),
-    (os.environ['REDIS_SENTINEL_3'], 26379)],
+    (os.environ['REDIS_SENTINEL_3'], 26379)], #TODO 26379 for evey sentinel now
     socket_timeout=10, #TODO check if it can be lowered
     socket_connect_timeout=5,
     socket_keepalive=True,
@@ -60,7 +60,7 @@ sentinel_async = Sentinel([
 )
 
 
-db_master = sentinel_async.master_for('saga-master', decode_responses=False)
+db_master = sentinel_async.master_for('order-master', decode_responses=False)
 
 
 db_slave = sentinel_async.slave_for('order-master', socket_timeout=1, decode_responses=False)
@@ -85,7 +85,7 @@ async def enqueue_outbox_message(routing_key: str, payload:dict):
         await db_master_saga.rpush(OUTBOX_KEY,json.dumps(message))
         logger.info(f"[Order Orchestrator] Enqueued message to outbox: {message}")
     except Exception as e:
-        logger.error(f"Error while enqueueing message to outbox: {str(e)}")
+        logger.error(f"Error while enqueueing message to outbox: {str(e)}", exc_info=True)
 
 async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dict|None, details=None,max_attempts: int=5,backoff_ms:int=100):
 #retry maybe todo too with max attempts?
@@ -145,7 +145,7 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
            await asyncio.sleep(backoff_ms/1000)
            backoff_ms *=2
        except Exception as e:
-        logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}")
+        logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}", exc_info=True)
     logger.critical("f[SAGA UPDATE] Failed after {max_attempts} attempts for {saga_id}.")
     return False
 
@@ -416,7 +416,7 @@ async def process_checkout_request(data, message):
                    logger.critical(f"[Saga] Failed to update {saga_id} with error: {str(e)}")
                    raise Exception("Saga update failed - will be sent to DLQ")
            except Exception as e:
-                logger.exception(f"Saga initialization failed: {str(e)}")
+                logger.exception(f"Saga initialization failed: {str(e)}", exc_info=True)
                 return {"error": str(e)}, 500
 
 @worker.register
@@ -497,7 +497,7 @@ async def process_stock_completed(data, message):
                     logger.critical(f"[Saga] Could not enqueue compensation for {saga_id} with error: {str(e)}")
                     raise Exception(f"Saga {saga_id} and enqueue compensation failed - will be sent to DLQ: {str(e)}")
             except Exception as e:
-               logger.exception(f"Error in process_stock_completed: {str(e)}")
+               logger.exception(f"Error in process_stock_completed: {str(e)}", exc_info=True)
 
 
 @worker.register
@@ -621,7 +621,7 @@ async def process_payment_completed(data, message):
                         "error": str(e)
                     })
             except Exception as e:
-                logger.exception(f"[SAGA] Critical error: {str(e)}")
+                logger.exception(f"[SAGA] Critical error: {str(e)}", exec_info=True)
                 raise
 
 
@@ -978,7 +978,7 @@ async def publish_event(routing_key, payload):
 
         await connection.close()
     except Exception as e:
-        logger.error(f"Error publishing event: {str(e)}")
+        logger.error(f"Error publishing event: {str(e)}", exc_info=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1085,7 +1085,7 @@ async def recover_in_progress_sagas():
                     
     except Exception as e:
         print(f"!!! ERROR INSIDE recover_in_progress_sagas: {e}", flush=True)
-        logger.error(f"Error recovering sagas: {str(e)}")
+        logger.error(f"Error recovering sagas: {str(e)}", exec_info=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1128,7 +1128,7 @@ async def consume_messages():
             await asyncio.Future()
 
         except Exception as e:
-            logger.error(f"Error in consume_messages: {str(e)}")
+            logger.error(f"Error in consume_messages: {str(e)}", exc_info=True)
             await asyncio.sleep(5)
 
 async def outbox_poller():
@@ -1149,7 +1149,7 @@ async def outbox_poller():
             await db_master_saga.lrem(f"{OUTBOX_KEY}:{routing_key}", 0,json.dumps(message))
             logger.info(f"[Outbox] Published event {routing_key} => {payload}")
         except Exception as e:
-            logger.error(f"Error publishing event: {str(e)}")
+            logger.error(f"Error publishing event: {str(e)}", exc_info=True)
             await asyncio.sleep(5)
 
 
