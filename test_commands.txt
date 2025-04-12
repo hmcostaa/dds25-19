@@ -1,0 +1,10 @@
+✗ docker-compose run --rm \
+  -e PYTHONPATH=/usr/src/app \
+  stock-service \
+  bash -c "pip install pytest pytest-asyncio msgspec && pytest --log-cli-level=DEBUG test_stock_service.py -v"
+
+
+  docker-compose run --rm \
+  -e PYTHONPATH=/usr/src/app \
+  stock-service \
+  bash -c "pip install pytest pytest-asyncio msgspec && pytest --log-cli-level=DEBUG test_stock_service.py -v"

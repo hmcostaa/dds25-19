@@ -7,7 +7,7 @@ import uuid
 import asyncio
 import time
 
-
+from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError
 from aiohttp import web
 from aio_pika import connect_robust, Message, DeliveryMode
 
@@ -24,7 +24,8 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort
 import warnings
 
-from global_idempotency.helper import check_idempotency_key, IdempotencyStoreConnectionError
+from global_idempotency.helper import check_idempotency_key, IdempotencyStoreConnectionError, idempotency_db_conn
+from global_idempotency.idempotency_decorator import idempotent
 
 warnings.filterwarnings("ignore", message=".*Python 2.7.*")
 
@@ -72,11 +73,11 @@ def enqueue_outbox_message(routing_key: str, payload:dict):
     except Exception as e:
         logger.error(f"Error while enqueueing message to outbox: {str(e)}")
 
-def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dict|None, details=None,):
+def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dict|None, details=None,max_attempts: int=5,backoff_ms:int=100):
 #retry maybe todo too with max attempts?
-
-    try:
-        saga_key = f"saga:{saga_id}"
+    saga_key = f"saga:{saga_id}"
+    for attempt in range(max_attempts):
+       try:
         saga_json = db_slave_saga.get(saga_key)
         if saga_json:
             saga_data = json.loads(saga_json)
@@ -122,12 +123,17 @@ def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dic
         
         logger.info(f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox: {message}")
         return True
-        
-    except redis.exceptions.RedisError as e:
-        logger.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
-        return False
-    except Exception as e:
+       except redis.exceptions.WatchError:
+           logger.warning(f"[SAGA UPDATE] Retry {attempt+1}/{max_attempts}. Saga {saga_id} failed to update. WatchError on {saga_id}")
+       except redis.exceptions.RedisError as e:
+           logger.error(f"[SAGA UPDATE] Redis error on attempt {attempt+1}: {e}")
+           logger.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
+           time.sleep(backoff_ms/1000)
+           backoff_ms *=2
+       except Exception as e:
         logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}")
+    logger.critical("f[SAGA UPDATE] Failed after {max_attempts} attempts for {saga_id}.")
+    return False
 
 def close_db_connection():
     logger.info("Closing DB connections")
@@ -377,29 +383,26 @@ async def process_checkout_request(data, message):
             # Mark the saga as failed
             # update_saga_state(saga_id, "SAGA_FAILED_INITIALIZATION", {"error": str(e)})
 
-            update_saga_and_enqueue(
-                saga_id=saga_id,
-                status="SAGA_FAILED_INITIALIZATION",
-                details={"error": str(e)},
-                routing_key=None,
-                payload=None,
-            )
-
-            # Notify order of failure
-            # await publish_event("order.checkout_failed", {
+           try:
+               success=update_saga_and_enqueue(
+                   saga_id=saga_id,
+                   status="SAGA_FAILED_INITIALIZATION",
+                   details={"error": str(e)},
+                   routing_key=None,
+                   payload=None,
+               )
+               if not success:
+                   logger.critical(f"[Saga] Failed to update {saga_id} with error: {str(e)}")
+                   raise Exception("Saga update failed - will be sent to DLQ")
+           except Exception as e:
+                logger.exception(f"Saga initialization failed: {str(e)}")
+                return
+            # enqueue_outbox_message("order.checkout_failed", {
             #     "saga_id": saga_id,
             #     "order_id": order_id,
             #     "status": "failed",
             #     "error": str(e)
             # })
-            
-            #outbox instead of enqueue
-            enqueue_outbox_message("order.checkout_failed", {
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "status": "failed",
-                "error": str(e)
-            })
 
 @worker.register
 async def process_stock_completed(data):
@@ -466,68 +469,20 @@ async def process_stock_completed(data):
     except Exception as e:
         logger.error(f"Error in process_stock_completed: {str(e)}")
         if 'saga_id' in locals():
-            # update_saga_state(saga_id, "PAYMENT_INITIATION_FAILED", {"error": str(e)})
-            # Request stock compensation since we can’t proceed
-            # await publish_event("stock.compensate", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id
-            # })
-            # enqueue_outbox_message("stock.compensate", )
-            # Notify order of failure
-            # await publish_event("order.checkout_failed", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id,
-            #     "status": "failed",
-            #     "error": str(e)
-            # })
-            
-
             #TODO: check updated
-            #combines the operations
-            update_saga_and_enqueue(
-                saga_id = saga_id,
-                status = "PAYMENT_INITIATION_FAILED",
-                details={"error": str(e)},
-                routing_key = "stock.compensate",
-                payload= {"saga_id": saga_id, "order_id": order_id}
-            )
-
-            enqueue_outbox_message("order.checkout_failed", {
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "status": "failed",
-                "error": str(e)
-            })
-
-
-# @worker.register
-# async def rollback_stock(order_id: str):
-#     order = get_order_from_db(order_id)
-#     items = order.items
-#     for item_id, quantity in items:
-#         payload = {
-#             "type": "unlock_stock",
-#             "data": {
-#                 "item_id": item_id,
-#                 "qunatity": quantity
-#             }
-#         }
-#         await rpc_client.call(payload, "stock_queue")
-#     update_saga_state(order_id, "STOCK_UNLOCKED")
-#
-#
-# @worker.register
-# async def rollback_payment(order_id: str, user_id: str, amount: int):
-#     payload = {
-#         "type": "add_credit",
-#         "data": {
-#             "user_id": user_id,
-#             "amount": amount,
-#             "order_id": order_id
-#         }
-#     }
-#     await rpc_client.call(payload, "payment_queue")
-#     update_saga_state(order_id, "PAYMENT_REVERSED")
+            try:
+                success = update_saga_and_enqueue(
+                    saga_id=saga_id,
+                    status="PAYMENT_INITIATION_FAILED",
+                    details={"error": str(e)},
+                    routing_key="stock.compensate",
+                    payload={"saga_id": saga_id, "order_id": order_id}
+                )
+                if not success:
+                    logger.critical(f"[Saga] Could not enqueue compensation for {saga_id} with error: {str(e)}")
+                    raise Exception(f"Saga {saga_id} and enqueue compensation failed - will be sent to DLQ: {str(e)}")
+            except Exception as e:
+               logger.exception(f"Error in process_stock_completed: {str(e)}")
 
 
 @worker.register
@@ -640,72 +595,31 @@ async def process_payment_completed(data):
     except Exception as e:
         logger.error(f"Error in process_payment_completed: {str(e)}")
         if 'saga_id' in locals():
-            
             #TODO: check updated
-            #combines the operations
-            success = update_saga_and_enqueue(
-                saga_id = saga_id,
-                status = "ORDER_FINALIZATION_FAILED",
-                details={"error": str(e)},
-                routing_key = "payment.reverse",
-                payload= {"saga_id": saga_id, "order_id": order_id}
-            )
-
-            # success = enqueue_outbox_message("order.checkout_failed", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id,
-            #     "status": "failed",
-            #     "error": str(e)
-            # })
-
-            if success:
+            try:
+                success = update_saga_and_enqueue(
+                    saga_id=saga_id,
+                    status="ORDER_FINALIZATION_FAILED",
+                    details={"error": str(e)},
+                    routing_key="payment.reverse",
+                    payload={"saga_id": saga_id, "order_id": order_id}
+                )
+                if not success:
+                    logger.critical(f"Could not update saga {saga_id} for order {order_id} during failure handling")
+                    raise Exception(f"Saga failure handler failed-message will go to DLQ")
                 enqueue_outbox_message("stock.compensate", {
-                    "saga_id": saga_id,
-                    "order_id": order_id
-                })
+                        "saga_id": saga_id,
+                        "order_id": order_id
+                    })
                 enqueue_outbox_message("order.checkout_failed", {
-                    "saga_id": saga_id,
-                    "order_id": order_id,
-                    "status": "failed",
-                    "error": str(e)
-                })
-        
-            else:
-                logger.critical(f"Failed to enqueue outbox messages for saga {saga_id}")
-                
-
-            
-            # update_saga_state(saga_id, "ORDER_FINALIZATION_FAILED", {"error": str(e)})
-            # # # Compensate payment and stock
-            # # await publish_event("payment.reverse", {
-            # #     "saga_id": saga_id,
-            # #     "order_id": order_id
-            # # })
-            # enqueue_outbox_message("payment.reverse",{
-            #     "saga_id": saga_id,
-            #     "order_id": order_id
-            # })
-            # # await publish_event("stock.compensate", {
-            # #     "saga_id": saga_id,
-            # #     "order_id": order_id
-            # # })
-            # enqueue_outbox_message("stock.compensate", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id
-            # })
-            # # # Notify failure
-            # # await publish_event("order.checkout_failed", {
-            # #     "saga_id": saga_id,
-            # #     "order_id": order_id,
-            # #     "status": "failed",
-            # #     "error": str(e)
-            # # })
-            # enqueue_outbox_message("order.checkout_failed", {
-            #     "saga_id": saga_id,
-            #     "order_id": order_id,
-            #     "status": "failed",
-            #     "error": str(e)
-            # })
+                        "saga_id": saga_id,
+                        "order_id": order_id,
+                        "status": "failed",
+                        "error": str(e)
+                    })
+            except Exception as e:
+                logger.exception(f"[SAGA] Critical error: {str(e)}")
+                raise
 
 
 async def process_failure_events(data, message):
@@ -827,34 +741,6 @@ async def process_failure_events(data, message):
         except Exception as e:
             logger.error(f"Error nacking message: {str(e)}")
 
-
-# ----------------------------------------------------------------------------
-# Idempotency Helper
-# ----------------------------------------------------------------------------
-
-async def execute_idempotent_operation(key: str, message, handler_function, *args, **kwargs):
-    try:
-        stored_result = check_idempotency_key(key)
-        if stored_result:
-            logger.info(f"Idempotency hit for key {key}. Acking.")
-            await message.ack()
-            return
-    except Exception as e:
-        logger.error(f"Error checking idempotency key: {str(e)}")
-        await message.nack(requeue=True)
-        return
-
-    # if idompentcy check is successful, call the handler function
-    try:
-        await handler_function(message.correlation_id, message.type, message.body, *args, **kwargs)
-    except Exception:
-        logger.exception(f"Handler {handler_function.__name__} failed for key {key}")
-
-
-# ----------------------------------------------------------------------------
-# Saga State Helpers
-# ----------------------------------------------------------------------------
-
 def send_post_request(url: str):
     try:
         response = requests.post(url)
@@ -866,72 +752,103 @@ def send_post_request(url: str):
 
 #TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
 @worker.register
+@idempotent("add_item",idempotency_db_conn,SERVICE_NAME)
 async def add_item(data):
     order_id = data.get("order_id")
     item_id = data.get("item_id")
     quantity = data.get("quantity")
-    order_entry: OrderValue = get_order_from_db(order_id)
+    if not order_id or not item_id or not quantity:
+        return {"error": "Missing required fields (order_id,item_id, quantity)"}, 400
+    stock_response=await rpc_client.call(
+        {
+            "type": "find_item",
+            "data":{"item_id":item_id}
+        },"stock_queue")
+    if not stock_response or "price" not in stock_response:
+        return {"error": f"Item {item_id} not found or invalid"}, 400
 
-    idempotency_key = f"idempotent:{SERVICE_NAME}:add_item:{order_id}:{item_id}:{quantity}" 
-
+    item_price=stock_response["price"]
+    item_stock=stock_response["stock"]
     try:
-        if global_idempotency.helper.check_idempotency_key(idempotency_key):
-            logger.info(f"[IDEMPOTENCY] Duplicate add_item request for key {idempotency_key}. Skipping.")
-            order_entry: OrderValue = get_order_from_db(order_id)
-            if order_entry:
-                 return {"msg": f"Item: {item_id} potentially already added to order: {order_id}. Current cost: {order_entry.total_cost}"}, 200
+        if item_stock < quantity:
+            return {"error": f"Item {item_id} is out of stock. Requested {quantity}, available {item_stock}."}, 400
+    except(ValueError, TypeError):
+        return {"error": "Invalid quantity specified"}, 400
+    def update_func(order: OrderValue) -> OrderValue:
+        order.items.append((item_id, quantity))
+        order.total_cost+=quantity*item_price
+    error_msg = None
+    try:
+        updated_order,error_msg=atomic_update_order(order_id, update_func=update_func)
+        if error_msg:
+            logging.error(f"Failed to update order {order_id}: {error_msg}")
+            logging.debug(error_msg)
+            if "not_found" in error_msg.lower():
+                status_code=404
             else:
-                 return {"msg": f"Item: {item_id} potentially already added. Order {order_id} not found?"}, 404 
+                status_code=500
+            return ({"added": False, "error": error_msg}, status_code)
+        elif updated_order:
+            logging.debug(f"Updated order {order_id}: {updated_order}")
+            update_saga_and_enqueue(
+                saga_id=order_id,
+                status="ITEM_ADDED",
+                routing_key=updated_order.routing_key,
+                payload=updated_order.payload
+            )
+            return ({"added": True, "order_id": order_id}, updated_order)
+        else:
+            return ({"added": False, "error": "Internal processing error"}, 500)
+    except ValueError as e:
+        error_msg=str(e)
+        return ({"added": False, "error": error_msg}, 400)
+    except Exception as e:
+        logging.exception("internal error")
+        return ({"added": False, "error": error_msg}, 400)
 
-    except global_idempotency.helper.IdempotencyStoreConnectionError as e:
-         logger.error(f"Idempotency check failed for add_item {idempotency_key}: {e}")
-         return {"error": "Idempotency check failed"}, 500
-
-    # Prepare the payload for the stock service
-    payload = {
-        "type": "find_item",  # Message type for the stock service
-        "data": {
-            "item_id": item_id
-        }
-    }
-
-    stock_response = await rpc_client.call(payload, "stock_queue")
-
-    # Check if the stock service returned an error
-    if not stock_response or "error" in stock_response:
-        abort(400, f"Item: {item_id} does not exist or stock service error!")
-
-    # Extract item details from the stock service response
-    item_price = stock_response.get("price")
-    if item_price is None:
-        abort(400, f"Item: {item_id} price not found!")
-
-    # Update the order with the new item
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_price
-
-    # Save the updated order back to the database
-    try:
-        db_master.set(order_id, msgpack.encode(order_entry))
-        # update_saga_state(order_id, "ITEM_ADDED")
-        update_saga_and_enqueue(
-            saga_id=order_id,
-            status="ITEM_ADDED",
-            routing_key=None,
-            payload=None,
-        )
-        #enqueue outbox??
+async def atomic_update_order(order_id, update_func):
+    max_retries = 5
+    base_backoff = 50
+    for attempt in range(max_retries):
+        pipe = db_master.pipeline(transaction=True)
         try:
-            global_idempotency.helper.store_idempotent_result(idempotency_key, {"status": "item_added"})
-            logger.info(f"[IDEMPOTENCY] Stored result for add_item key {idempotency_key}")
-        except Exception as ie:
-             logger.error(f"Failed to store idempotency key {idempotency_key} after add_item: {ie}")
-             # operation succeeded-> however idempotency might fail on retry if key wasn't stored.
+            pipe.watch(order_id)
+            entry=pipe.get(order_id)
+            if not entry:
+                pipe.reset()
+                logging.warning("Atomic update: order: %s", order_id)
+                return {"error":f"Order {order_id} not found"}
+            try:
+             order_val = msgpack.Decoder(OrderValue).decode(entry)
+            except MsgspecDecodeError:
+             pipe.reset()
+             logging.error("Atomic update: Decode error for order %s", order_id)
+             return None, "Internal data format error"
+            try:
+             updated_order = update_func(order_val)
+             pipe.multi()
+             pipe.set(order_id, msgpack.Encoder().encode(updated_order))
+             pipe.execute()
+             return updated_order,200
+            except ValueError as e:
+                pipe.reset()
+                raise e
+        except redis.WatchError:
+            # key was modified between watch and execute, retry backoff
+            backoff_multiplier = (2 ** attempt) * (1 + random.random() * 0.1)
+            backoff = base_backoff * backoff_multiplier
+            await asyncio.sleep(backoff / 1000)
+            continue  # loop again
 
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        except redis.RedisError:
+            return None, DB_ERROR_STR
+        except ValueError:
+            raise
 
-    return {"msg": f"Item: {item_id} added to order: {order_id}, total cost updated to: {order_entry.total_cost}"}
+        except Exception as e:
+            logging.exception(f"Unexpected error in atomic_update_order for order {order_id}: {e}")
+            return None, "Internal data error"
+
 
 
 # Helper methods locks
@@ -1251,9 +1168,8 @@ async def outbox_poller():
         try:
             #blpop instead of loop
             #TODO what if message loss between LOP and succesfull AMQP publish???
-
-            raw=db_master_saga.blpop(OUTBOX_KEY,timeout=5)
-
+            #Added brpoplush to prevent the issue
+            raw=db_master_saga.brpoplpush(OUTBOX_KEY, f"{OUTBOX_KEY}:processing",timeout=5)
             if not raw:
                 await asyncio.sleep(1)
                 continue
@@ -1261,19 +1177,13 @@ async def outbox_poller():
             routing_key=message.get("routing_key")
             payload=message.get("payload")
 
-            connection = await connect_robust(AMQP_URL)
-            channel = await connection.channel()
-            exchange = await channel.declare_exchange("saga_events", "topic", durable=True)
-            amqp_message = Message(
-                body=json.dumps(payload).encode(),
-                delivery_mode=DeliveryMode.PERSISTENT
-            )
-            await exchange.publish(amqp_message, routing_key=routing_key)
+            await publish_event(routing_key=routing_key,payload=payload)
+            db_master_saga.lrem(f"{OUTBOX_KEY}:{routing_key}", 0,json.dumps(message))
             logger.info(f"[Outbox] Published event {routing_key} => {payload}")
-            await connection.close()
         except Exception as e:
             logger.error(f"Error publishing event: {str(e)}")
             await asyncio.sleep(5)
+
 
 
 # ----------------------------------------------------------------------------
