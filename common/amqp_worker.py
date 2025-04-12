@@ -28,10 +28,7 @@ class AMQPWorker:
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.callbacks = {}
-        # self._use_manual_acks = use_manual_acks # possibility to use manual acks, still testing
-        # self._use_manual_acks = use_manual_acks
         logger.info(f"AMQPWorker queue name: '{queue_name}'")
-        # logger.info(f"AMQPWorker queue name: '{queue_name}' Manual ACKs: {use_manual_acks}")
 
     def register(self, callback):
         """
@@ -42,28 +39,56 @@ class AMQPWorker:
             raise ValueError(f"Provided callback '{callback}' is not callable.")
         
         #check for asyn func??
-        message_type = callback.__name__  # Use the function's name as the message type
+        message_type = callback.__name__ 
         self.callbacks[message_type] = callback
         logging.info(f"Registered callback for message type: '{message_type}'")
 
-
-    #decooupled reply
     async def _handle_reply(self, message: AbstractIncomingMessage, response):
         correlation_id = message.correlation_id or str(uuid.uuid4())
-        if message.reply_to and response is not None:
+        reply_body_dict = {} 
+        final_status_code = 500 
+
+        if isinstance(response, tuple) and len(response) == 2 and isinstance(response[1], int):
+            data_or_error_dict = response[0]
+            final_status_code = response[1]
+            if isinstance(data_or_error_dict, dict):
+                if "error" in data_or_error_dict:
+                    reply_body_dict["error"] = data_or_error_dict["error"] 
+                else:
+                    reply_body_dict["data"] = data_or_error_dict
+
+            else:
+                reply_body_dict["error"] = "Worker returned invalid data format"
+                final_status_code = 500
+            reply_body_dict["status_code"] = final_status_code 
+        else:
+            logger.warning(f"Handler for msg type '{message.type}' returned unexpected format: {type(response)}. CorrID: {correlation_id}")
+            reply_body_dict["error"] = "Internal worker error: Unexpected response format"
+            reply_body_dict["status_code"] = 500 
+
+        if message.reply_to:
             try:
+                json_body = json.dumps(reply_body_dict).encode("utf-8")
+                logging.info(f"--- WORKER HANDLE REPLY: Sending structured reply for CorrID {correlation_id}: {reply_body_dict}")
+
                 await self.channel.default_exchange.publish(
                     Message(
-                        body=json.dumps(response).encode(),
+                        body=json_body,
                         correlation_id=correlation_id,
-                        delivery_mode= DeliveryMode.PERSISTENT #persistent replies
+                        content_type="application/json", 
+                        delivery_mode=DeliveryMode.PERSISTENT
                     ),
                     routing_key=message.reply_to,
                 )
-            except Exception as e:
-                logging.error(f"Error publishing reply for message {message.correlation_id}: {str(e)}")
 
-                            
+                logger.info(f"Reply for message {correlation_id} sent successfully")
+            
+            except Exception as e:
+                logger.error(f"Error publishing structured reply for message {correlation_id}: {str(e)}", exc_info=True)
+        elif not message.reply_to:
+            
+            logger.warning(f"No reply_to queue specified for CorrID {correlation_id}, reply not sent.")
+
     async def start(self):
         """
         Start consuming messages from the queue.
@@ -121,98 +146,84 @@ class AMQPWorker:
         response_tuple = None
         handler = None
         message_type = None
-        processed_successfully = False
-        ack_status = "pending"
+        handler_succeeded = False
+        reply_succeeded = False
 
+        #decode
+        print(f"--- AMQP: on_message - Received message type='{message.type}', DeliveryTag={message.delivery_tag} ---")
         try:
-            data = json.loads(message.body.decode())
-            message_type = message.type
-            logger.debug(f" Received message type='{message_type}', DeliveryTag={message.delivery_tag}")
-
-            if not message_type in self.callbacks:
-                ack_status = "nacked_dlq"
-                return
             try:
-                handler = self.callbacks[message_type]
-                logger.debug(f"calling handler '{handler.__name__}'")
-                # call handler with (data, message) 
-                response_tuple = await handler(data, message)
+                data = json.loads(message.body.decode('utf-8'))
+                message_type = message.type
+                print(f"--- AMQP: on_message - Received message type='{message_type}', DeliveryTag={message.delivery_tag} ---")
 
-                processed_successfully = True
-                logger.info("Reply processed successfully")
+                if not message_type:
+                    print(f"--- AMQP: on_message - Message type not found-")
+                    await message.nack(requeue=False)
+                    return
+                handler = self.callbacks[message_type]
+                logger.debug(f"AMQP found handler '{handler.__name__} for message type '{message_type}'")
+
+            except json.JSONDecodeError as e:
+                logger.error(f"failed to decode JSON. error={e}, corrID={message.correlation_id}, DeliveryTag={message.delivery_tag}", exc_info=True)
+                await message.nack(requeue=False)
+                return
+            except KeyError as e:
+                logger.error(f" No handler found for message type '{message_type}'")
+                await message.nack(requeue=False)
+                return
+            except Exception as e:
+                logger.critical(f"Unexpected error in on_message: {e}")
+                await message.nack(requeue=False)
+                return
+
+
+            #execute handler
+            try:
+                print(f"--- AMQP_WORKER: Before calling handler {handler.__name__} for DeliveryTag {message.delivery_tag}")
+                response_tuple = await handler(data, message)
+                handler_succeeded = True
+                print(f"--- AMQP_WORKER: After calling handler {handler.__name__} for DeliveryTag {message.delivery_tag}")
+                logger.info(f"Handler {handler.__name__} for message type '{message_type}' executed successfully")
 
             except (redis.RedisError, asyncio.TimeoutError, IdempotencyStoreConnectionError, ConnectionError) as e:
                 logger.warning(f"Transient error DeliveryTag={message.delivery_tag} Error={str(e)}")
-                ack_status = "nacked_dlq"
-            
+                handler_succeeded = False
             except Exception as e:
-                logger.error(f"Fatal error DeliveryTag={message.delivery_tag} Error={str(e)}")
-                ack_status = "nacked_dlq"
-                #potential rpc timeout custom rpc timeout
-                #transient errors
+                logger.error(f"Fatal error DeliveryTag={message.delivery_tag} Type={type(e)} Error={str(e)}", exc_info=True)
+                handler_succeeded = False
 
-        # except json.JSONDecodeError as e:
-        #     logger.error(f"JSONDecodeError DeliveryTag={message.delivery_tag} Error={str(e)}")
-        #     requeue = False
-        # except Exception as e:
-        #     logger.exception("Error in message processing loop DeliverTag=%s", message.delivery_tag)
-        #     requeue = False
-
-        #     #retry/DlQ TODO
-        #     #potentially requeue for some errors??
-        #     #for now --> just assume processing error -> no requeue
-
-        #     # try:
-        #     #     await message.nack(should_requeue)
-        #     #     logger.info("Message nacked DeliverTag=%s", message.delivery_tag)
-        #     # except Exception as e:
-        #     #     logger.exception("Error nacking message UNKNOWN")
-        #     # return
-        # try:
-            if processed_successfully:
+            if handler_succeeded and message.reply_to:
                 try:
                     await self._handle_reply(message, response_tuple)
-                    logger.info("Message processed successfully")
+                    reply_succeeded = True
+                    logger.info(f"Reply for message {message.correlation_id} sent successfully")
                 except Exception as e:
                     logger.error(f"Error handling reply for message {message.correlation_id}: {str(e)}")
-        
+                    reply_succeeded = False
+            elif handler_succeeded and not message.reply_to:
+                reply_succeeded = True #no was reply needed
+                logger.info(f"Handler {handler.__name__} for message type '{message_type}' executed successfully")
+    
         except Exception as e:
-            logger.critical("unexpected critical error, DeliverTag=%s", message.delivery_tag)
-
+            logger.critical(f"Unexpected error in on_message: {e}")
+            handler_succeeded = False
+            reply_succeeded = False
+        
         finally:
+            print(f"--- AMQP_WORKER: on_message - Finally ---")
             try:
-                if ack_status == "pending":
-                    if processed_successfully:
-                        await message.ack()
-                        ack_status = "acked"
-                        logger.debug("Message acked DeliverTag=%s", message.delivery_tag)
-                    else:
-                        logger.warning("finally: Message processing failed, DeliverTag=%s", message.delivery_tag)
-                        await message.nack(requeue=True)
-                        ack_status = "nacked_dlq"
-
-                elif ack_status == "nacked_dlq":
+                if handler_succeeded and reply_succeeded:
+                    await message.ack()
+                    logger.info(f"Message {message.correlation_id} processed successfully")
+                else:
+                    reason = "Handler failed" if not handler_succeeded else "Reply failed" if not reply_succeeded else "Unknown"
+                    logger.warning(f"Message {message.correlation_id} failed: {reason}")
                     await message.nack(requeue=False)
-                    logger.debug("Message nacked DeliverTag=%s", message.delivery_tag)
-
-                elif ack_status == "acked":
-                    pass
-
             except Exception as e:
-                #failed to ack/nack after processing, TERRIBLE
-
-                logger.critical(f"Error acking message, processing succceeded but ack failed, DeliverTag={message.delivery_tag}")
-
-        #not necessary because of the deadletter queue
-        # else:
-        #     #processing failed, weird case, since exceptions are handled above
-        #     logger.warning("Message processing failed, DeliverTag=%s", message.delivery_tag)
-        #     try:
-        #         await message.nack(requeue=False)
-        #     except Exception as e:
-        #         logger.exception("Error in fallback nack for DeliverTag=%s", message.delivery_tag)
-
-
+                logger.critical(f"Unexpected error in on_message: {e}", exc_info=True)
+                #not really a resolveable error
+    
 
     async def send_message(self, payload, queue, correlation_id, reply_to, action=None, callback_action=None, attempt_id=None):
        
@@ -243,5 +254,3 @@ class AMQPWorker:
             ),
             routing_key=queue,
         )
-        # logger.debug(f"Sent message Action='{action}' CorrID='{correlation_id}' AttemptID='{attempt_id}' to queue '{queue}'")
-        # return correlation_id, attempt_id

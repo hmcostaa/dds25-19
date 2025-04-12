@@ -40,7 +40,7 @@ idempotency_db = redis.Redis(
 )
 
 try:
-    idempotency_db.ping()
+    # idempotency_db.ping()
     logger.info(f"Connected to idempotency Redis at {IDEMPOTENCY_REDIS_HOST}:{IDEMPOTENCY_REDIS_PORT}")
 except redis.ConnectionError as e:
     logger.error(f"Failed to connect to idempotency Redis: {str(e)}")
@@ -50,7 +50,7 @@ except redis.ConnectionError as e:
 IdempotencyResultTuple = Tuple[Dict[str, Any], int]
 
     
-def check_idempotent_operation(key:str, redis_conn: redis.Redis)->bool:
+def check_idempotent_operation(key:str, redis_conn: redis.Redis)->Optional[IdempotencyResultTuple]:
 #retry implementation?
     try:
         result_bytes = redis_conn.get(key)
@@ -103,15 +103,12 @@ def store_idempotent_result(
         logger.error(f"Failed to encode msgpack {key}: {e}")
         raise IdempotencyDataError(f"Failed to encode msgpack {key}: {e}")
     
-    was_set = False
     try:
-        was_set = idempotency_db.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
-
-        if was_set:
-            logger.info(f"Successfully stored idempotency result for key '{key}'.")
-        else:
-            logger.warning(f"Idempotency key '{key}' already existed. Did not overwrite.")
-        return was_set is True 
+        # idempotency_db.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
+        # line executed regardless whether set succeeded or not --> always true was returned
+        # set should have been 'captured'
+        was_set = redis_conn.set(key, result_bytes, ex=IDEMPOTENT_KEY_TTL, nx=True)
+        return was_set is True
 
     except redis.exceptions.RedisError as e:
         logger.error(f"Redis error storing idempotency result: {str(e)}")

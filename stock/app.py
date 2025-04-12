@@ -5,23 +5,23 @@ import time
 import uuid
 import asyncio
 import random
+from typing import Tuple, Dict, Any, Union 
 from common.amqp_worker import AMQPWorker
-import redis
-from redis.exceptions import WatchError, RedisError
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
 from flask import Flask, jsonify, abort, Response
-from redis import Sentinel
-
+import redis.asyncio as redis
+from redis.asyncio.sentinel import Sentinel 
+from redis.exceptions import WatchError, RedisError
 from global_idempotency.idempotency_decorator import idempotent
 
 DB_ERROR_STR = "DB error"
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 
-logging = logging.getLogger("stock-service")
+logger = logging.getLogger("stock-service")
 
 SERVICE_NAME = "stock"
 
@@ -30,19 +30,24 @@ worker = AMQPWorker(
     queue_name="stock_queue",
 )
 
+sentinel_async = Sentinel([
+    (os.environ['REDIS_SENTINEL_1'], 26379),
+    (os.environ['REDIS_SENTINEL_2'], 26379),
+    (os.environ['REDIS_SENTINEL_3'], 26379)],
+    socket_timeout=10, # TODO check if this is the right value, potentially lower it
+    socket_connect_timeout=5,
+    socket_keepalive=True,
+    password=os.environ['REDIS_PASSWORD'],
+    decode_responses=False
+)
 
-sentinel= Sentinel([
-    (os.environ['REDIS_SENTINEL_1'],26379),
-    (os.environ['REDIS_SENTINEL_2'],26380),
-    (os.environ['REDIS_SENTINEL_3'],26381)], socket_timeout=0.1, password= os.environ['REDIS_PASSWORD'])
-
-db_master=sentinel.master_for('stock-master', socket_timeout=0.1, decode_responses=False)
-db_slave=sentinel.slave_for('stock-master', socket_timeout=0.1, decode_responses=False)
+db_master=sentinel_async.master_for('stock-master',  decode_responses=False)
+db_slave=sentinel_async.slave_for('stock-master',  decode_responses=False)
 
 #no slave since idempotency is critical to payment service
 idempotency_db_conn = db_master 
 
-logging.info("Connected to idempotency (Stock) Redis.")
+logger.info("Connected to idempotency (Stock) Redis.")
 
 
 def close_db_connection():
@@ -57,52 +62,74 @@ class StockValue(Struct):
     stock: int
     price: int
 
-def get_item_from_db(item_id: str) -> StockValue | None:
+async def get_item_from_db(item_id: str) -> Tuple[Union[StockValue, str], int]:
     # get serialized data
+    print(f"--- STOCK: get_item_from_db - Getting item_id={item_id} from DB ---")
+    logger.info(f"--- STOCK: get_item_from_db - Getting item_id={item_id} from DB ---")
     try:
-        entry: bytes = db_slave.get(item_id)
+        entry: bytes = await db_slave.get(item_id)
     except redis.exceptions.RedisError:
         return DB_ERROR_STR, 400
+    print(f"--- STOCK: get_item_from_db - Decoded entry type={type(entry)}, value='{str(entry)[:100]}...' ---")
+    logger.info(f"--- STOCK: get_item_from_db - Decoded entry type={type(entry)}, value='{str(entry)[:100]}...' ---")
     # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
-        # if item does not exist in the database; abort
-        return f"Item: {item_id} not found!", 400
-    return entry, 200
+         return {"error": f"Item: {item_id} not found!"}, 404
+    try:
+         logger.info(f"--- STOCK: get_item_from_db - Attempting msgpack.decode...")
+         item_entry: StockValue = msgpack.decode(entry, type=StockValue)
+         logger.info(f"--- STOCK: get_item_from_db - Decode SUCCESS")
+         return item_entry, 200
+    except (MsgspecDecodeError, TypeError) as decode_err:
+         logger.error(f"Decode error for item {item_id}: {decode_err}")
+         return {"error": "Internal data format error"}, 500
+    except Exception as e:
+         logger.error(f"Unexpected error processing item {item_id}: {e}", exc_info=True)
+         return {"error": "Unexpected processing error"}, 500
+
 
 async def atomic_update_item(item_id: str, update_func):
     max_retries = 5
     base_backoff = 50 
 
     for attempt in range(max_retries):
-        pipe = db_master.pipeline(transaction=True)
+        # await pipe = db_master.pipeline(transaction=True)
         try:
-            pipe.watch(item_id)
-
-            entry = pipe.get(item_id) #noawait
-
-            if entry is None:
-                    pipe.reset() # quick reset before returning
-                    logging.warning("Atomic update: item: %s", item_id)
-                    return None, f"item {item_id} not found"
+            async with db_master.pipeline(transaction=True) as pipe:
             
-            try:
-                item_val: StockValue = msgpack.Decoder(StockValue).decode(entry)
-            except MsgspecDecodeError:
-                pipe.reset()
-                logging.error("Atomic update: Decode error for item %s", item_id)
-                return None, "Internal data format error"
-            
-            try:
-                updated_item = update_func(item_val)
+                await pipe.watch(item_id)
+
+                entry = await pipe.get(item_id) #noawait
+
+                if entry is None:
+                        await pipe.unwatch()# quick reset before returning
+                        logger.warning("Atomic update: item: %s", item_id)
+                        return None, f"item {item_id} not found"
+                
+                try:
+                    item_val: StockValue = msgpack.Decoder(StockValue).decode(entry)
+                    await pipe.unwatch()
+                except MsgspecDecodeError:
+                    # pipe.re
+                    logger.error("Atomic update: Decode error for item %s", item_id)
+                    return None, "Internal data format error"
+                
+                try:
+                    updated_item = update_func(item_val)
+                
+                except ValueError as e:
+                    await pipe.unwatch()
+                    raise e
+                except Exception as e:
+                    await pipe.unwatch()
+                    return None, f"Unexpected error in atomic_update_item for item {item_id}: {e}"
+                
                 pipe.multi()
                 pipe.set(item_id, msgpack.Encoder().encode(updated_item))
 
-                pipe.execute() #execute if no other client modified item_id (pipe.watch)
+                results = await pipe.execute() #execute if no other client modified item_id (pipe.watch)
                 return updated_item, None #succesfull
-            except ValueError as e:
-                pipe.reset()
-                raise e
+                
                 
         except WatchError:
             #key was modified between watch and execute, retry backoff 
@@ -118,63 +145,59 @@ async def atomic_update_item(item_id: str, update_func):
             raise
         
         except Exception as e:
-            logging.exception(f"Unexpected error in atomic_update_item for item {item_id}: {e}")
+            logger.exception(f"Unexpected error in atomic_update_item for item {item_id}: {e}")
             return None, "Internal data error"
             
     return None, f"Failed to update item, retries nr??."
 
 @worker.register
-async def create_item(data):
+async def create_item(data, message):
     price = data.get("price")
     try:
         key = str(uuid.uuid4())
-        logging.debug(f"Item: {key} created")
+        logger.debug(f"Item: {key} created")
         value = msgpack.encode(StockValue(stock=0, price=int(price)))
-        db_master.set(key, value)
+        await db_master.set(key, value)
         return {'item_id': key}, 200
     
     except redis.exceptions.RedisError as re:
-        return str(re), 400
+        return {'error': f"Redis Error: {re}"}, 500
     except Exception as e:
-        # Catch any other unexpected exceptions to prevent silent failures
-        return f"Unexpected error: {str(e)}", 401
+        return {'error': f"Unexpected error: {str(e)}"}, 500
 
 @worker.register
-async def batch_init_stock(data):
+async def batch_init_stock(data, message):
     n = int(data.get("n"))
     starting_stock = int(data.get("starting_stock"))
     item_price = int(data.get("item_price"))
     kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
-        db_master.mset(kv_pairs)
+        await db_master.mset(kv_pairs)
     except redis.exceptions.RedisError as re:
-        return str(re), 400
+        return {'error': str(re)}, 500
     except Exception as e:
-        # Catch any other unexpected exceptions to prevent silent failures
-        return f"Unexpected error: {str(e)}", 401
+        return {'error': f"Unexpected error: {str(e)}"}, 500
 
     return {'msg': f"{kv_pairs.keys()}"}, 200
 
 
 @worker.register
-async def find_item(data):
+async def find_item(data, message):
+    print(f"--- STOCK: find_item - Received data={data} ---")
     item_id = data.get("item_id")
-    item_entry, response_code = get_item_from_db(item_id)
-
-    if response_code == 400:
-        return item_entry, 400
+    item_entry, response_code = await get_item_from_db(item_id)
+    if response_code != 200:
+        return item_entry, response_code
 
     return {"stock": item_entry.stock,
             "price": item_entry.price } , 200
 
 @worker.register
 @idempotent('add_stock', idempotency_db_conn, SERVICE_NAME)
-async def add_stock(data):
+async def add_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
-    order_id = data.get("order_id")
-    attempt_id = data.get("attempt_id")
 
     if not all([item_id, amount is not None]):
         return {"error": "Missing required fields (item_id, amount)"}, 400
@@ -184,7 +207,7 @@ async def add_stock(data):
         if amount_int <= 0:
             return {"error": "Transaction amount must be positive"}, 400
     except (ValueError, TypeError):
-        logging.error("Unexpected error, amount:.", amount)
+        logger.error("Unexpected error, amount:.", amount)
         return {"error": "Invalid amount?"}, 400
     
     
@@ -199,8 +222,8 @@ async def add_stock(data):
         updated_item, error_msg = await atomic_update_item(item_id, updater)
     
         if error_msg:
-            logging.error(f"'add_stock' logic failed: {error_msg}")
-            logging.debug(f"error_msg: {error_msg}")
+            logger.error(f"'add_stock' logic failed: {error_msg}")
+            logger.debug(f"error_msg: {error_msg}")
             if "not found" in error_msg.lower(): 
                 status_code = 404
             else: 
@@ -208,7 +231,7 @@ async def add_stock(data):
             return ({"added": False, "error": error_msg}, status_code)
             
         elif updated_item:
-            logging.info(f"Item: {item_id} stock updated to: {updated_item.stock}")
+            logger.info(f"Item: {item_id} stock updated to: {updated_item.stock}")
             return ({"added": True, "stock": updated_item.stock}, 200)
 
         else:
@@ -219,17 +242,17 @@ async def add_stock(data):
         error_msg = str(e)
         return ({"paid": False, "value error": error_msg}, 400)
     except Exception as e:
-        logging.exception("internal error")
+        logger.exception("internal error")
         return ({"paid": False, "internal error": error_msg}, 400)
 
 @worker.register
 @idempotent('remove_stock', idempotency_db_conn, SERVICE_NAME)
-async def remove_stock(data):
+async def remove_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
 
     if not all([item_id, amount is not None]):
-        logging.error("Missing item_id or amount in remove_stock request.")
+        logger.error("Missing item_id or amount in remove_stock request.")
         return {"error": "Missing required fields"}, 400
         
     try:
@@ -241,27 +264,26 @@ async def remove_stock(data):
     
     def updater(item: StockValue) -> StockValue:
         if item.stock < int(amount):
-            # Raise ValueError for insufficient stock
-            raise ValueError(f"Insufficient stock for item {item_id} (available: {item.stock}, requested: {int(amount)})")
+            raise ValueError(f"Error, Insufficient stock for item {item_id} (available: {item.stock}, requested: {int(amount)})")
         item.stock -= int(amount)
         return item
     
     try:
         updated_item, error_msg = await atomic_update_item(item_id, updater)
         if error_msg:
-            logging.error(f"Failed to cancel stock (refund) for user {item_id}: {error_msg}")
+            logger.error(f"Failed to cancel stock (refund) for user {item_id}: {error_msg}")
             status_code = 404 if "not found" in error_msg.lower() else 500
             return {"error": f"Failed to cancel stock: {error_msg}"}, status_code
         if updated_item:
             return {"removed": True, "stock": updated_item.stock}, 200
         else:
-            logging.error(f"Cancel stock failed for user {item_id}, unknown reason .")
+            logger.error(f"Cancel stock failed for user {item_id}, unknown reason .")
             return {"error": "Failed stock cancellation, unknown reason"}, 500
     except ValueError as e:
-        logging.warning(f"Insufficient stock for user {item_id}: {e}")
-        return {"error": f"Insufficient stock for user {item_id}: {e}"}, 400
+        logger.warning(f"Error:Insufficient stock for user {item_id}: {e}")
+        return {"error": f"Error:Insufficient stock for user {item_id}: {e}"}, 400
     except Exception as e:
-        logging.exception("Error canceling stock for user %s: %s", item_id, e)
+        logger.exception("Error canceling stock for user %s: %s", item_id, e)
         return {"error": f"Error canceling stock for user {item_id}: {e}"}, 500
         
 if __name__ == '__main__':

@@ -25,7 +25,7 @@ class IdempotencyStoreConnectionError(Exception):
 def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str):
     def decorator(func):
         @functools.wraps(func)
-        async def wrapper(data: dict):
+        async def wrapper(data: dict, *args, **kwargs):
             user_id = data.get("user_id")  # payment
             item_id = data.get("item_id")  # stock
             order_id = data.get("order_id")
@@ -33,7 +33,7 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
 
             if not order_id or not attempt_id:
                 logger.warning(f"'{operation_name}' called without order_id or attempt_id. Skipping idempotency check.")
-                return await func(data) 
+                return await func(data, *args, **kwargs)
 
             if service_name == "payment" and user_id:
                  key_parts = [service_name, operation_name, user_id, order_id, attempt_id]
@@ -67,7 +67,7 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
 
             result_tuple: Tuple[Any, int] | None = None
             try:
-                result_tuple = await func(data)
+                result_tuple = await func(data, *args, **kwargs)
                 logger.debug(f"operation for key {redis_key} executed. Result: {result_tuple}")
 
                 try:
