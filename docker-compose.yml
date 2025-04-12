@@ -26,8 +26,11 @@ services:
     command: hypercorn app -b 0.0.0.0:5000
     environment:
       AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+      PYTHONPATH: /usr/src/app
     ports:
       - "8080:5000"
+    volumes:
+      - ./common:/usr/src/app/common
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -272,32 +275,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ------------------------- Order Service & Orchestrator -----------------------------------
-  # order-orchestrator:
-  #   build:
-  #     context: .
-  #     dockerfile: order-orchestrator/Dockerfile
-  #   image: order-orchestrator:latest
-  #   environment:
-  #     - AMQP_URL=amqp://user:password@rabbitmq:5672/
-  #     - ORDER_SERVICE_URL=http://order-service:5000
-  #     - SAGA_REDIS_HOST=redis-saga-master
-  #     - SAGA_REDIS_PORT=6379
-  #     - SAGA_REDIS_PASSWORD=redis
-  #     - SAGA_REDIS_DB=1
-  #   networks:
-  #     - redis-cluster-network
-  #   depends_on:
-  #     rabbitmq:
-  #       condition: service_healthy
-  #     redis-saga-master:
-  #       condition: service_healthy
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-
   order-service:
     build: ./order
     image: order:latest
@@ -344,12 +321,15 @@ services:
       - ./global_idempotency:/usr/src/app/global_idempotency
     # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     environment:
-      AMQP_URL: "amqp://rabbitmq"
+      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
       SAGA_REDIS_HOST: redis-saga-master
       SAGA_REDIS_PORT: 6379
       SAGA_REDIS_PASSWORD: redis
       SAGA_REDIS_DB: 1
 
+
+      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+      IDEMPOTENCY_REDIS_PASSWORD: redis
     # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
 
     env_file:
@@ -393,6 +373,9 @@ services:
       SAGA_REDIS_PORT: 6379
       SAGA_REDIS_PASSWORD: redis
       SAGA_REDIS_DB: 1
+
+      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+      IDEMPOTENCY_REDIS_PASSWORD: redis
 
     env_file:
       - env/payment_redis.env

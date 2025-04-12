@@ -5,12 +5,10 @@ import sys
 import sys
 import uuid
 import asyncio
-from redis import Sentinel
-from redis import Sentinel
-import redis
-
+import redis.asyncio as redis
+from redis.asyncio.sentinel import Sentinel 
 from flask import Flask, jsonify, abort, Response
-from typing import Optional, Tuple, Any
+from typing import Optional, Tuple, Any, Union, Tuple, Dict
 from redis.exceptions import WatchError, RedisError
 import random
 import logging
@@ -39,19 +37,19 @@ worker = AMQPWorker(
 
 DB_ERROR_STR = "DB error"
 
-#pytest --maxfail=1 --disable-warnings -q
+sentinel_async = Sentinel([
+    (os.environ['REDIS_SENTINEL_1'], 26379),
+    (os.environ['REDIS_SENTINEL_2'], 26379),
+    (os.environ['REDIS_SENTINEL_3'], 26379)],
+    socket_timeout=10, #TODO check if this is the right value, potentially lower it
+    socket_connect_timeout=5,
+    socket_keepalive=True,
+    password=os.environ['REDIS_PASSWORD'],
+    decode_responses=False
+)
 
-
-sentinel = Sentinel([
-    (os.environ.get('REDIS_SENTINEL_1', 'localhost'), 26379),
-    (os.environ.get('REDIS_SENTINEL_2', 'localhost'), 26380),
-    (os.environ.get('REDIS_SENTINEL_3', 'localhost'), 26381)
-], socket_timeout=0.1, password=os.environ.get('REDIS_PASSWORD', None))
-
-db_master = sentinel.master_for('payment-master', socket_timeout=0.1, decode_responses=False)
-db_slave = sentinel.slave_for('payment-master', socket_timeout=0.1, decode_responses=False)
-
-
+db_master = sentinel_async.master_for('payment-master', decode_responses=False)
+db_slave = sentinel_async.slave_for('payment-master', decode_responses=False)
 logging.info("Connected to Redis Sentinel.")
 
 #no slave since idempotency is critical to payment service
@@ -72,18 +70,23 @@ atexit.register(close_db_connection)
 class UserValue(Struct):
     credit: int
 
-def get_user_from_db(user_id: str) -> Optional[UserValue]:
+async def get_user_from_db(user_id: str) -> Tuple[Union[UserValue, Dict], int]: 
+    print(f"--- PAYMENT: get_user_from_db: ENTERED for user_id={user_id}")
     try:
-        # get serialized data
-        entry: Optional[bytes] = db_slave.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: Optional[UserValue] = msgpack.decode(entry, type=UserValue) if entry else None
+        entry: Optional[bytes] = await db_slave.get(user_id)
+    except redis.exceptions.RedisError as redis_err:
+        logging.error(f"Redis GET ERROR: {redis_err}")
+        return {"error": DB_ERROR_STR}, 500
     if entry is None:
-        # if user does not exist in the database; abort
-        abort(400, f"User: {user_id} not found!")
-    return entry
+        logging.error(f"User {user_id} NOT FOUND")
+        return {"error": f"User: {user_id} not found!"}, 404
+    try:
+        user_entry: UserValue = msgpack.decode(entry, type=UserValue)
+        print(f"--- PAYMENT: get_user_from_db: Decode SUCCESS")
+        return user_entry, 200
+    except (MsgspecDecodeError, TypeError) as decode_err:
+         print(f"--- PAYMENT: get_user_from_db: Decode FAILED: {decode_err}")
+         return {"error": "Internal data format error"}, 500
 
 async def atomic_update_user(user_id: str, update_func):
     #retry? backoff/?
@@ -93,58 +96,64 @@ async def atomic_update_user(user_id: str, update_func):
 
     # async with db.pipeline(transaction=True) as pipe: # async pipeline, should probably be used TODO
     for attempt in range(max_retries):
-        pipe = db_master.pipeline(transaction=True)
+        # pipe = db_master.pipeline(transaction=True)
         try:
-            #idempotency check?
-            # if ?
-            # max retry attempts
-            #watche exec pipeline
+            async with db_master.pipeline(transaction=True) as pipe:
+                #idempotency check?
+                # if ?
+                # max retry attempts
+                #watche exec pipeline
 
-            # await pipe.watch(user_id)
-            pipe.watch(user_id)
+                # await pipe.watch(user_id)
+                await pipe.watch(user_id)
 
-            #bytes/?
-            entry = pipe.get(user_id) #noawait
+                #bytes/?
+                entry = await pipe.get(user_id) #noawait
 
-            # entry = await pipe.get(user_id)
-            if entry is None:
-                    pipe.reset() # quick reset before returning
-                    logging.warning("Atomic update: User: %s", user_id)
-                    return None, f"User {user_id} not found"
+                # entry = await pipe.get(user_id)
+                if entry is None:
+                        await pipe.unwatch()# quick reset before returning
+                        logging.warning("Atomic update: User: %s", user_id)
+                        return None, f"User {user_id} not found"
+                
+                #disistuingish between leader and follower??
+                #db_master.pipeline()?
+                try:
+                    user_val: UserValue = msgpack.Decoder(UserValue).decode(entry)
+                    await pipe.unwatch()
+                except MsgspecDecodeError:
+                    # pipe.reset()
+                    logging.error("Atomic update: Decode error for user %s", user_id)
+                    return None, "Internal data format error"
+                
+                try:
+                    updated_user = update_func(user_val)
+                    #synchronous
+                    #error?
+                except ValueError as e:
+                    await pipe.unwatch()
+                    raise e
+                except Exception as e:
+                    await pipe.unwatch()
+                    return None, f"Unexpected error in atomic_update_user for user {user_id}: {e}"
             
-            #disistuingish between leader and follower??
-            #db_master.pipeline()?
-            try:
-                user_val: UserValue = msgpack.Decoder(UserValue).decode(entry)
-            except MsgspecDecodeError:
-                pipe.reset()
-                logging.error("Atomic update: Decode error for user %s", user_id)
-                return None, "Internal data format error"
-            
-            try:
-                updated_user = update_func(user_val)
-                #synchronous
-                #error?
                 pipe.multi()
                 pipe.set(user_id, msgpack.Encoder().encode(updated_user))
 
-                pipe.execute() #execute if no other client modified user_id (pipe.watch)
+                results = await pipe.execute() #execute if no other client modified user_id (pipe.watch)
                 return updated_user, None #succesfull
-            except ValueError as e:
-                pipe.reset()
-                raise e
+                
                 
         except WatchError:
             #key was modified between watch and execute, retry backoff 
             #backoff?? TODO
+            logging.warning(f"WatchError: key was modified between watch and execute, retry backoff")
             backoff_multiplier = (2 ** attempt) * (1 + random.random() * 0.1)
             backoff = base_backoff * backoff_multiplier
             
             await asyncio.sleep(backoff / 1000)
             continue #loop again
 
-        # except redis.WatchError:
-        #     continue 
         except redis.RedisError:
             return None, DB_ERROR_STR
         
@@ -162,11 +171,11 @@ def require_user_id(data):
     return str(uid).strip()
 
 @worker.register
-async def create_user(data):
+async def create_user(data, message):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
-        db_master.set(key, value)
+        await db_master.set(key, value)
         return {'user_id': key}, 200
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
@@ -174,37 +183,39 @@ async def create_user(data):
         logging.exception("Error creating user: %s", e)
         return {"error": f"Error creating user: {e}"}, 400
     
+     
 @worker.register
-async def batch_init_users(data):
+async def batch_init_users(data, message):
     n = int(data['n'])
     starting_money = int(data['starting_money'])
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        db_master.mset(kv_pairs)
+        await db_master.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
     return {"msg": "Batch init for users successful"}, 200
 
 
 @worker.register
-async def find_user(data):
+async def find_user(data, message):
     try:
-        user_id = require_user_id(data)
-        user_entry = get_user_from_db(user_id)
-        # if error:
-        #     return error
+        user_id = data.get("user_id")
+        user_entry, status_code = await get_user_from_db(user_id)
+        if status_code != 200:
+            return {"error": f"Error retrieving user from DB for id {user_id}: {status_code}"}, status_code
         
-        response = {"user_id": user_id, "credit": user_entry.credit}
-        logging.debug(f"Found user {user_id} with credit {user_entry.credit}")
+        user_entry2 = user_entry # to avoid status code error
+        response = {"user_id": user_id, "credit": user_entry2.credit}
+        logging.debug(f"Found user {user_id} with credit {user_entry2.credit}")
         return response, 200
     except Exception as e:
         logging.exception("Error retrieving user from DB for id %s: %s", user_id, e)
-        abort(400, f"Error retrieving user: {e}")
-
+        return {"error": f"Error retrieving user from DB for id {user_id}: {e}"}, 500
+    
 @worker.register
 @idempotent('add_funds', idempotency_db_conn, SERVICE_NAME)
-async def add_funds(data):
+async def add_funds(data, message):
     user_id =  require_user_id(data)
     amount = int(data.get("amount", 0))
     
@@ -236,14 +247,12 @@ async def add_funds(data):
 
 @worker.register
 @idempotent('pay', idempotency_db_conn, SERVICE_NAME)
-async def pay(data):
+async def pay(data, message):
     user_id = data.get("user_id")
-    order_id = data.get("order_id")
     amount = int(data.get("amount", 0))
-    attempt_id = data.get("attempt_id")
 
-    if not all([user_id, order_id, attempt_id, amount is not None]):
-        logging.error("Missing required fields (user_id, order_id, amount, attempt_id)")
+    if not all([user_id, amount is not None]):
+        logging.error("Missing required fields (user_id amount)")
         return {"error": "Missing required fields"}, 400
     try:
         amount_int = int(amount)
@@ -259,47 +268,37 @@ async def pay(data):
         user.credit -= int(amount)
         return user
 
-    # updated_user, error_msg, res_tuple = None, None, None
     updated_user = None
     error_msg = None
+    response_tuple = None 
 
-    try: 
-        updated_user, error_msg = await atomic_update_user(user_id, updater) 
+    try:
+        logging.info(f"--- PAYMENT PAY HANDLER: Calling atomic_update_user for user {user_id}")
+        updated_user, error_msg = await atomic_update_user(user_id, updater)
+        logging.info(f"--- PAYMENT PAY HANDLER: atomic_update_user returned: user={updated_user}, error={error_msg}")
 
-        if error_msg:
-            logging.error(f"'pay' logic failed: {error_msg}")
-            logging.debug(f"error_msg: {error_msg}")
-            if "insufficient credit" in error_msg.lower():
-                status_code = 400 
-            elif "not found" in error_msg.lower(): 
-                status_code = 404
-            else: 
-                status_code = 500
-            return ({"paid": False, "error": error_msg}, status_code)
-            
-        elif updated_user:
-            logging.info(f" 'pay' logic succeeded: New credit: {updated_user.credit}")
-            return ({"paid": True, "credit": updated_user.credit}, 200)
+        if updated_user:
+            response_tuple = ({"paid": True, "credit": updated_user.credit}, 200)
+        elif error_msg:
+            status_code = 400 if "insufficient credit" in error_msg.lower() else (404 if "not found" in error_msg.lower() else 500)
+            response_tuple = ({"paid": False, "error": error_msg}, status_code)
         else:
-            #fallback
-            return ({"paid": False, "error": "Internal processing error"}, 500)
-    
-    except ValueError as e:
-     if "insufficient credit" in error_msg.lower():
-         logging.warning(f"Caught insufficient credit ValueError for user {user_id}: {error_msg}")
-         return ({"paid": False, "error": "Insufficient credit"}, 400)
-     else:
-         logging.exception("Caught unexpected ValueError in pay")
-         return ({"paid": False, "error": f"Invalid value: {error_msg}"}, 400)
+            response_tuple = ({"paid": False, "error": "Internal processing error"}, 500)
 
+        logging.info(f"--- PAYMENT PAY HANDLER: Returning response tuple: {response_tuple}")
+        return response_tuple 
+
+    except ValueError as e:
+        response_tuple = ({"paid": False, "error": str(e)}, 400 if "insufficient credit" in str(e).lower() else 400)
+        logging.error(f"--- PAYMENT PAY HANDLER: Caught ValueError: {e}, returning: {response_tuple}")
+        return response_tuple
     except Exception as e:
-        logging.exception("internal error")
-        return ({"paid": False, "internal error": error_msg}, 400)
-    
-    
-    
+        response_tuple = ({"paid": False, "internal error": str(e)}, 500) 
+        logging.exception(f"--- PAYMENT PAY HANDLER: Caught Exception: {e}, returning: {response_tuple}")
+        return response_tuple 
+
 @worker.register
-async def remove_credit(data):
+async def remove_credit(data, message):
     user_id = data.get("user_id")
     amount = int(data.get("amount", 0))
 
@@ -318,17 +317,11 @@ async def remove_credit(data):
         return {"error": error_msg}, 400
     return {"msg": f"Removed {amount} from user {user_id}"}, 200
 
-
-
-
-
 @worker.register
 @idempotent('compensate', idempotency_db_conn, SERVICE_NAME)
-async def compensate(data):
+async def compensate(data, message):
     try:
         user_id = data.get("user_id")
-        order_id = data.get("order_id") 
-        attempt_id = data.get("attempt_id")
         amount = data.get("amount")
 
         if not all([user_id, amount is not None]):
@@ -363,63 +356,3 @@ async def compensate(data):
 if __name__ == '__main__':
     logging.info("Starting payment service AMQP worker...")
     asyncio.run(worker.start())
-
-# @worker.register
-# async def reverse(data):
-#     user_id = data.get("user_id")
-#     amount = int(data.get("amount", 0))
-
-#     if not user_id or amount <= 0:
-#         return {"error": "Invalid reverse amount"}, 400
-
-#     def updater(user: UserValue) -> UserValue:
-#         user.credit += amount
-#         return user
-
-#     updated_user, error_msg = await atomic_update_user(user_id, updater)
-
-#     if error_msg:
-#         return {"error": error_msg}, 400
-#     return {"msg": f"Refunded {amount} to user {user_id}"}, 200
-# @worker.register
-# @idempotent('cancel_payment', idempotency_db_conn, SERVICE_NAME)
-# async def cancel_payment(data):
-#     try:
-#         user_id = data.get("user_id")
-#         order_id = data.get("order_id") 
-#         attempt_id = data.get("attempt_id")
-#         amount = data.get("amount")
-
-#         if not all([user_id, amount is not None]):
-#             logging.error("Missing user_id or amount in cancel_payment request.")
-#             return {"error": "Missing required fields"}, 400
-        
-#         if int(amount) <= 0:
-#             return {"error": "Transaction amount must be positive"}, 400
-        
-#     except (ValueError, TypeError):
-#         return {"error": "Invalid amount specified"}, 400
-    
-#     def updater(user: UserValue) -> UserValue:
-#         user.credit += amount
-#         return user
-    
-#     try:
-#         updated_user, error_msg = await atomic_update_user(user_id, updater)
-#         if error_msg:
-#             logging.error(f"Failed to cancel payment (refund) for user {user_id}: {error_msg}")
-#             status_code = 404 if "not found" in error_msg.lower() else 500
-#             return {"error": f"Failed to cancel payment: {error_msg}"}, status_code
-#         if updated_user:
-#             return {"refunded": True, "credit": updated_user.credit}, 200
-#         else:
-#             logging.error(f"Cancel payment failed for user {user_id}, unknown reason .")
-#             return {"error": "Failed cancellation, unknown reason"}, 500
-#     except Exception as e:
-#         logging.exception("Error canceling payment for user %s: %s", user_id, e)
-#         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
-    
-# if __name__ == '__main__':
-#     logging.info("Starting payment service AMQP worker...")
-#     asyncio.run(worker.start())
-# 

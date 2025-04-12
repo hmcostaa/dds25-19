@@ -49,10 +49,10 @@ try:
 except redis.ConnectionError as e:
     logger.error(f"Failed to connect to idempotency Redis: {str(e)}")
 
-def generate_idempotency_key(SERVICE_NAME, user_id, order_id, attempt_id):
-    idempotency_key = f"idempotent:{SERVICE_NAME}:pay:{user_id}:{order_id}:{attempt_id}"
-    idempotency_utf8 = idempotency_key.encode('utf-8')
-    return idempotency_key,idempotency_utf8
+def generate_idempotency_key(SERVICE_NAME, operation_name, user_id, order_id, attempt_id):
+    idempotency_key = f"idempotent:{SERVICE_NAME}:{operation_name}:{user_id}:{order_id}:{attempt_id}"
+    # idempotency_utf8 = idempotency_key.encode('utf-8')
+    return idempotency_key
 
 
 def check_idempotent_operation(key: str, redis_conn: redis.Redis) -> Optional[IdempotencyResultTuple]:
