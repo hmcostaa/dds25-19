@@ -13,7 +13,7 @@ from aiohttp import web
 from aio_pika import connect_robust, Message, DeliveryMode, RobustConnection, RobustChannel, RobustExchange
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
 from typing import Optional, Tuple, Dict, Any, Union, List
-
+from global_idempotency.idempotency_decorator import idempotent
 import global_idempotency
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
@@ -92,7 +92,7 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
     saga_key = f"saga:{saga_id}"
     for attempt in range(max_attempts):
        try:
-            saga_json = db_slave_saga.get(saga_key)
+            saga_json = await db_slave_saga.get(saga_key)
             if saga_json:
                 saga_data = json.loads(saga_json)
             else:
@@ -142,7 +142,7 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
        except redis.exceptions.RedisError as e:
            logger.error(f"[SAGA UPDATE] Redis error on attempt {attempt+1}: {e}")
            logger.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
-           time.sleep(backoff_ms/1000)
+           await asyncio.sleep(backoff_ms/1000)
            backoff_ms *=2
        except Exception as e:
         logger.error(f"Error updating saga state {saga_id} to {status}: {str(e)}")
@@ -717,6 +717,8 @@ async def process_failure_events(data, message):
         except Exception as e:
             logger.error(f"Error nacking message: {str(e)}")
 
+
+#TODO potentially blocking and synchronous
 def send_post_request(url: str):
     try:
         response = requests.post(url)
@@ -773,10 +775,11 @@ async def add_item(data, message):
     def update_func(order: OrderValue) -> OrderValue:
         order.items.append((item_id, quantity))
         order.total_cost+=quantity*item_price
+        return order
 
     error_msg = None
     try:
-        updated_order,error_msg=atomic_update_order(order_id, update_func=update_func)
+        updated_order,error_msg= await atomic_update_order(order_id, update_func=update_func)
         if error_msg:
             logging.error(f"Failed to update order {order_id}: {error_msg}")
             logging.debug(error_msg)
@@ -787,13 +790,14 @@ async def add_item(data, message):
             return ({"added": False, "error": error_msg}, status_code)
         elif updated_order:
             logging.debug(f"Updated order {order_id}: {updated_order}")
-            update_saga_and_enqueue(
+            await update_saga_and_enqueue(
                 saga_id=order_id,
                 status="ITEM_ADDED",
-                routing_key=updated_order.routing_key,
-                payload=updated_order.payload
+                routing_key=None,
+                payload=None,
+                details={"item_id": item_id, "quantity": quantity}
             )
-            return ({"added": True, "order_id": order_id}, updated_order)
+            return {"data": {"added": True, "order_id": order_id, "new_total_cost": updated_order.total_cost}}, 200
         else:
             return ({"added": False, "error": "Internal processing error"}, 500)
     except ValueError as e:
@@ -809,29 +813,37 @@ async def atomic_update_order(order_id, update_func):
     max_retries = 5
     base_backoff = 50
     for attempt in range(max_retries):
-        pipe = db_master.pipeline(transaction=True)
         try:
-            pipe.watch(order_id)
-            entry=pipe.get(order_id)
-            if not entry:
-                pipe.reset()
-                logging.warning("Atomic update: order: %s", order_id)
-                return {"error":f"Order {order_id} not found"}
-            try:
-             order_val = msgpack.Decoder(OrderValue).decode(entry)
-            except MsgspecDecodeError:
-             pipe.reset()
-             logging.error("Atomic update: Decode error for order %s", order_id)
-             return None, "Internal data format error"
-            try:
-             updated_order = update_func(order_val)
-             pipe.multi()
-             pipe.set(order_id, msgpack.Encoder().encode(updated_order))
-             pipe.execute()
-             return updated_order,200
-            except ValueError as e:
-                pipe.reset()
-                raise e
+            async with db_master.pipeline(transaction=True) as pipe:
+                await pipe.watch(order_id)
+                entry= await pipe.get(order_id)
+                if not entry:
+                    await pipe.unwatch()
+                    logging.warning("Atomic update: order: %s", order_id)
+                    return None, f"Order {order_id} not found"
+                
+                try:
+                    order_val = msgpack.Decoder(OrderValue).decode(entry)
+                    await pipe.unwatch()
+                except MsgspecDecodeError:
+                    await pipe.unwatch()
+                    logging.error("Atomic update: Decode error for order %s", order_id)
+                    return None, "Internal data format error"
+                
+                try:
+                    updated_order = update_func(order_val)
+                    
+                except ValueError as e:
+                    await pipe.unwatch()
+                    raise e
+                except Exception as e:
+                    await pipe.unwatch()
+                    return None, f"Unexpected error in atomic_update_order for order {order_id}: {e}"
+                pipe.multi()
+                pipe.set(order_id, msgpack.Encoder().encode(updated_order))
+                results = await pipe.execute()
+
+                return updated_order, None 
         except redis.WatchError:
             # key was modified between watch and execute, retry backoff
             backoff_multiplier = (2 ** attempt) * (1 + random.random() * 0.1)
@@ -863,9 +875,8 @@ async def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
         is_locked = await db_master.set(lock_key, lock_value, nx=True, px=lock_timeout)
         if is_locked:
             logger.info(f"Lock acquired for order: {order_id}")
-            await db_master.hmset(
-                f"lock_meta:{lock_key}",
-                {
+            await db_master.hset(
+                f"lock_meta:{lock_key}", mapping={
                     "service_id": SERVICE_ID,
                     "ttl": SAGA_STATE_TTL,
                     "lock_timeout": lock_timeout,
@@ -929,8 +940,8 @@ async def force_release_locks(order_id: str) -> bool:
             acquired_at = float(meta.get("acquired_at", 0))
             timeout = int(meta.get("lock_timeout", LOCK_TIMEOUT))
             if time.time() - (acquired_at + (timeout / 1000) * 2):
-                db_master.delete(lock_key)
-                db_master.delete(meta_key)
+                await db_master.delete(lock_key)
+                await db_master.delete(meta_key)
                 logger.warning(f"Force released lock for order: {order_id}")
                 return True
         return False
@@ -1126,7 +1137,7 @@ async def outbox_poller():
             #blpop instead of loop
             #TODO what if message loss between LOP and succesfull AMQP publish???
             #Added brpoplush to prevent the issue
-            raw=db_master_saga.brpoplpush(OUTBOX_KEY, f"{OUTBOX_KEY}:processing",timeout=5)
+            raw= await db_master_saga.brpoplpush(OUTBOX_KEY, f"{OUTBOX_KEY}:processing",timeout=5)
             if not raw:
                 await asyncio.sleep(1)
                 continue
@@ -1135,7 +1146,7 @@ async def outbox_poller():
             payload=message.get("payload")
 
             await publish_event(routing_key=routing_key,payload=payload)
-            db_master_saga.lrem(f"{OUTBOX_KEY}:{routing_key}", 0,json.dumps(message))
+            await db_master_saga.lrem(f"{OUTBOX_KEY}:{routing_key}", 0,json.dumps(message))
             logger.info(f"[Outbox] Published event {routing_key} => {payload}")
         except Exception as e:
             logger.error(f"Error publishing event: {str(e)}")

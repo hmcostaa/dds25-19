@@ -122,7 +122,7 @@ async def atomic_update_user(user_id: str, update_func):
                     user_val: UserValue = msgpack.Decoder(UserValue).decode(entry)
                     await pipe.unwatch()
                 except MsgspecDecodeError:
-                    # pipe.reset()
+                    await pipe.unwatch()
                     logging.error("Atomic update: Decode error for user %s", user_id)
                     return None, "Internal data format error"
                 
