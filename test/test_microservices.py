@@ -8,7 +8,7 @@ class TestMicroservices(unittest.TestCase):
 
     def test_stock(self):
         # Test /stock/item/create/<price>
-        item_data, item_status = tu.create_item(5)
+        item_data, item_status = tu.create_item(10)
         self.assertTrue(tu.status_code_is_success(item_status))
         print(f"--- TEST: TestMicroservices - item_data={item_data} ---")
         print(f"--- TEST: TestMicroservices - item_data[0]={item_data}, item_data[1]={item_data} ---")
@@ -18,7 +18,7 @@ class TestMicroservices(unittest.TestCase):
         # Test /stock/find/<item_id>
         item_data, item_status = tu.find_item(item_id)
         self.assertTrue(tu.status_code_is_success(item_status))
-        self.assertEqual(item_data['price'], 5)
+        self.assertEqual(item_data['price'], 10)
         self.assertEqual(item_data['stock'], 0)
 
         # Test /stock/add/<item_id>/<number>
