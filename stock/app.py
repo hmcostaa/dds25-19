@@ -178,8 +178,10 @@ async def batch_init_stock(data, message):
     n = int(data.get("n"))
     starting_stock = int(data.get("starting_stock"))
     item_price = int(data.get("item_price"))
-    kv_pairs: dict[str, bytes] = {f"{str(uuid.uuid4())}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
+    kv_pairs: dict[str, bytes] = {
+        f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
+        for i in range(n)
+    }
     try:
         await db_master.mset(kv_pairs)
     except redis.exceptions.RedisError as re:
@@ -206,7 +208,7 @@ async def find_item(data, message):
 async def add_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
-
+    idempotency_key = data.get("idempotency_key")
     if not all([item_id, amount is not None]):
         return {"error": "Missing required fields (item_id, amount)"}, 400
     
@@ -258,17 +260,30 @@ async def add_stock(data, message):
 async def remove_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
-
+    saga_id = data.get("saga_id")
+    order_id = data.get("order_id")
     if not all([item_id, amount is not None]):
         logger.error("Missing item_id or amount in remove_stock request.")
-        return {"error": "Missing required fields"}, 400
+        error_response = {"error": "Missing required fields"}
+        if saga_id:
+            error_response["saga_id"] = saga_id
+            error_response["order_id"] = order_id
+        return error_response,400
         
     try:
         if int(amount) <= 0:
-            return {"error": "Transaction amount must be positive"}, 400
+            error_response = {"error": "Transaction amount must be positive"}
+            if saga_id:
+                error_response["saga_id"] = saga_id
+                error_response["order_id"] = order_id
+            return error_response, 400
         
     except (ValueError, TypeError):
-        return {"error": "Invalid amount specified"}, 400
+        error_response= {"error": "Invalid amount specified"}
+        if saga_id:
+            error_response["saga_id"] = saga_id
+            error_response["order_id"] = order_id
+        return error_response, 400
     
     def updater(item: StockValue) -> StockValue:
         if item.stock < int(amount):
@@ -281,18 +296,56 @@ async def remove_stock(data, message):
         if error_msg:
             logger.error(f"Failed to cancel stock (refund) for user {item_id}: {error_msg}")
             status_code = 404 if "not found" in error_msg.lower() else 500
-            return {"error": f"Failed to cancel stock: {error_msg}"}, status_code
+            error_response= {"error": f"Failed to cancel stock: {error_msg}"}
+            if saga_id:
+                error_response["saga_id"] = saga_id
+                error_response["order_id"] = order_id
+            return error_response, status_code
+
         if updated_item:
-            return {"removed": True, "stock": updated_item.stock}, 200
+            success_response= {"removed": True,
+                "stock": updated_item.stock,
+                "saga_id": saga_id,
+                "order_id": order_id}
+            if saga_id:
+                success_response["saga_id"] = saga_id
+                success_response["order_id"] = order_id
+            if message and hasattr(message, 'reply_to') and message.reply_to:
+                try:
+                    callback_action = message.headers.get('callback_action')
+                    if callback_action:
+                        logger.info(f"Sending callback to {message.reply_to} with action {callback_action}")
+                        await worker.send_message(
+                            payload=success_response,
+                            queue=message.reply_to,
+                            correlation_id=saga_id,
+                            action=callback_action
+                        )
+                except Exception as callback_err:
+                    logger.error(f"Error sending callback: {callback_err}")
+            return success_response, 200
         else:
             logger.error(f"Cancel stock failed for user {item_id}, unknown reason .")
-            return {"error": "Failed stock cancellation, unknown reason"}, 500
+            error_response = {"error": "Failed stock cancellation, unknown reason"}
+            if saga_id:
+                error_response["saga_id"] = saga_id
+                error_response["order_id"] = order_id
+            return error_response, 500
     except ValueError as e:
+        error_message = f"Error:Insufficient stock for item {item_id}: {e}"
         logger.warning(f"Error:Insufficient stock for user {item_id}: {e}")
-        return {"error": f"Error:Insufficient stock for user {item_id}: {e}"}, 400
+        error_response = {"error": error_message}
+        if saga_id:
+            error_response["saga_id"] = saga_id
+            error_response["order_id"] = order_id
+        return error_response, 400
     except Exception as e:
         logger.exception("Error canceling stock for user %s: %s", item_id, e)
-        return {"error": f"Error canceling stock for user {item_id}: {e}"}, 500
+        error_response = {"error": f"Error canceling stock for user {item_id}: {e}"}
+        if saga_id:
+            error_response["saga_id"] = saga_id
+            error_response["order_id"] = order_id
+        return error_response, 500
 
 async def main():
     try:
