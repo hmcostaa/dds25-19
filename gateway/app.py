@@ -84,14 +84,18 @@ async def add_item(order_id, item_id, quantity):
     return await handle_rpc_response(result)
 
 @app.route("/orders/checkout/<order_id>", methods=["POST"])
-async def checkout_order(order_id): 
+async def checkout_order(order_id):
     idempotency_key = ensure_idempotency_key()
     payload = {
         "order_id": order_id,
         "idempotency_key": idempotency_key
     }
+    logger.info(f"Gateway: Sending checkout RPC for order {order_id}")
     result = await rpc_client.call("order_queue", "process_checkout_request", payload)
-    return await handle_rpc_response(result)
+    logger.info(f"Gateway: Received RPC result for order {order_id}: {result}") 
+    response_tuple = await handle_rpc_response(result)
+    logger.info(f"Gateway: Sending HTTP response for order {order_id}: {response_tuple}") 
+    return response_tuple
 
 
 ######## Stock Service Routes ########
