@@ -24,6 +24,7 @@ logging.basicConfig(
 logging = logging.getLogger("payment-service")
 SERVICE_NAME = "payment"
 
+IdempotencyResultTuple = Tuple[Dict[str, Any], int]
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -52,16 +53,24 @@ db_master = sentinel_async.master_for('payment-master', decode_responses=False)
 db_slave = sentinel_async.slave_for('payment-master', decode_responses=False)
 logging.info("Connected to Redis Sentinel.")
 
-#no slave since idempotency is critical to payment service
-idempotency_db_conn = db_master 
+#changed.. now saga master is used for idempotency as centralized client
+# Read connection details from environment variables
+
+idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)) 
+idempotency_redis_client = sentinel_async.master_for(
+    "saga-master",
+    decode_responses=False,
+    db=idempotency_redis_db
+)
 
 logging.info("Connected to idempotency (Payment) Redis.")
 
 
-def close_db_connection():
-    db_master.close()
-    db_slave.close()
-    idempotency_db_conn.close()
+async def close_db_connection():
+    await db_master.close()
+    await db_slave.close()
+    await idempotency_redis_client.close()
+
 
 
 atexit.register(close_db_connection)
@@ -171,6 +180,7 @@ def require_user_id(data):
     return str(uid).strip()
 
 @worker.register
+@idempotent('create_user', idempotency_redis_client, SERVICE_NAME) #not sure if idempotent or not TODO
 async def create_user(data, message):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
@@ -214,8 +224,8 @@ async def find_user(data, message):
         return {"error": f"Error retrieving user from DB for id {user_id}: {e}"}, 500
     
 @worker.register
-@idempotent('add_funds', idempotency_db_conn, SERVICE_NAME)
-async def add_funds(data, message):
+@idempotent('add_funds', idempotency_redis_client, SERVICE_NAME)
+async def add_funds(data, message) -> IdempotencyResultTuple:
     user_id =  require_user_id(data)
     amount = int(data.get("amount", 0))
     
@@ -226,30 +236,25 @@ async def add_funds(data, message):
         user.credit += amount
         return user
     
-    try:
-        # atomic_update_user(data["user_id"], updater)
-        updated_user, error_msg = await atomic_update_user(user_id, updater)
-
-        if error_msg:
-            logging.error(f"Failed to add funds for user {user_id}: {error_msg}")
-            return {"error": f"Failed to add funds: {error_msg}"}, 500 
-
-        if updated_user:
-            return {"done": True, "credit": updated_user.credit}, 200
-        else:
-            return {"error": "Failed to update user, unknown reason"}, 500
     
-    except (ValueError, TypeError):
-        return {"error": "Invalid amount specified"}, 400
-    except Exception as e:
-        logging.exception(f"Unexpected error adding funds for user {user_id}: {e}") 
-        return {"error": "Unexpected error, add funds"}, 500
+    # decorator now handles try except
+    # atomic_update_user(data["user_id"], updater)
+    updated_user, error_msg = await atomic_update_user(user_id, updater)
 
+    if error_msg:
+        logging.error(f"Failed to add funds for user {user_id}: {error_msg}")
+        return {"error": f"Failed to add funds: {error_msg}"}, 500 
+
+    if updated_user:
+        return {"done": True, "credit": updated_user.credit}, 200
+    else:
+        return {"error": "Failed to update user, unknown reason"}, 500
+    
 @worker.register
-@idempotent('pay', idempotency_db_conn, SERVICE_NAME)
-async def pay(data, message):
+@idempotent('pay', idempotency_redis_client, SERVICE_NAME)
+async def pay(data, message) -> IdempotencyResultTuple:
     user_id = data.get("user_id")
-    amount = int(data.get("amount", 0))
+    amount = data.get("amount")
 
     if not all([user_id, amount is not None]):
         logging.error("Missing required fields (user_id amount)")
@@ -275,7 +280,6 @@ async def pay(data, message):
     try:
         logging.info(f"--- PAYMENT PAY HANDLER: Calling atomic_update_user for user {user_id}")
         updated_user, error_msg = await atomic_update_user(user_id, updater)
-        logging.info(f"--- PAYMENT PAY HANDLER: atomic_update_user returned: user={updated_user}, error={error_msg}")
 
         if updated_user:
             response_tuple = ({"paid": True, "credit": updated_user.credit}, 200)
@@ -298,9 +302,10 @@ async def pay(data, message):
         return response_tuple 
 
 @worker.register
-async def remove_credit(data, message):
+@idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME)
+async def remove_credit(data, message)-> IdempotencyResultTuple:
     user_id = data.get("user_id")
-    amount = int(data.get("amount", 0))
+    amount = data.get("amount")
 
     if not user_id or amount <= 0:
         return {"error": "Invalid request"}, 400
@@ -318,7 +323,7 @@ async def remove_credit(data, message):
     return {"msg": f"Removed {amount} from user {user_id}"}, 200
 
 @worker.register
-@idempotent('compensate', idempotency_db_conn, SERVICE_NAME)
+@idempotent('compensate', idempotency_redis_client, SERVICE_NAME)
 async def compensate(data, message):
     try:
         user_id = data.get("user_id")

@@ -1,6 +1,7 @@
 import os
-from quart import Quart, jsonify
+from quart import Quart, jsonify, request
 from common.rpc_client import RpcClient
+import uuid
 
 import logging
 
@@ -39,14 +40,25 @@ async def handle_rpc_response(rpc_result):
         logger.error(f"Gateway received unexpected response format: {type(rpc_result)} - {rpc_result}")
         return {"error": "Internal Server Error - Invalid response format from worker"}, 500
 
+# payload key
+def ensure_idempotency_key() -> str:
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
+        logger.debug(f"Generated Idempotency-Key: {idempotency_key}")
+    else:
+        logger.debug(f"Using provided Idempotency-Key: {idempotency_key}")
+    return idempotency_key
+
 ######## Order Service Routes ########
 
 
 @app.route("/orders/create/<user_id>", methods=["POST"])
 async def create_order(user_id):
-    # now consistent payload structure
+    idempotency_key = ensure_idempotency_key()
     payload = {
-        "user_id": user_id
+        "user_id": user_id,
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call("order_queue", "create_order", payload)
     return await handle_rpc_response(result)
@@ -61,18 +73,22 @@ async def find_order(order_id):
 
 @app.route("/orders/addItem/<order_id>/<item_id>/<quantity>", methods=["POST"]) 
 async def add_item(order_id, item_id, quantity):
+    idempotency_key = ensure_idempotency_key()
     payload = {
         "order_id": order_id,
         "item_id": item_id,
-        "quantity": int(quantity)
+        "quantity": int(quantity),
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call("order_queue","add_item",payload )
     return await handle_rpc_response(result)
 
 @app.route("/orders/checkout/<order_id>", methods=["POST"])
 async def checkout_order(order_id): 
+    idempotency_key = ensure_idempotency_key()
     payload = {
-        "order_id": order_id
+        "order_id": order_id,
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call("order_queue", "process_checkout_request", payload)
     return await handle_rpc_response(result)
@@ -82,7 +98,9 @@ async def checkout_order(order_id):
 
 @app.route("/stock/item/create/<price>", methods=["POST"])
 async def create_item(price):
-    payload = {"price": int(price)}
+    idempotency_key = ensure_idempotency_key()
+    payload = {"price": int(price), "idempotency_key": idempotency_key}
+    
     result = await rpc_client.call(queue="stock_queue", action="create_item", payload=payload)
     return await handle_rpc_response(result)
 
@@ -95,9 +113,11 @@ async def find_item(item_id):
     
 @app.route("/stock/add/<item_id>/<amount>", methods=["POST"])
 async def add_stock_item(item_id, amount):
+    idempotency_key = ensure_idempotency_key()
     payload = {
         "item_id": item_id,
-        "amount": amount
+        "amount": amount,
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call(queue="stock_queue",
                                            action="add_stock",
@@ -106,9 +126,11 @@ async def add_stock_item(item_id, amount):
 
 @app.route("/stock/subtract/<item_id>/<amount>", methods=["POST"])
 async def subtract_stock(item_id, amount):
+    idempotency_key = ensure_idempotency_key()
     payload = {
         "item_id": item_id,
-        "amount": int(amount) 
+        "amount": int(amount),
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call(queue="stock_queue", action="remove_stock", payload=payload)
     return await handle_rpc_response(result)
@@ -129,9 +151,14 @@ async def batch_init(n,starting_stock,item_price):
 
 @app.route("/payment/add_funds/<user_id>/<amount>", methods=["POST"])
 async def add_credit_to_user(user_id, amount):
+    idempotency_key = ensure_idempotency_key()
+    if not idempotency_key:
+        idempotency_key = str(uuid.uuid4())
+        logger.debug(f"No idempotency key found in request headers for add_funds. Generated key: {idempotency_key}")
     payload = {
         "user_id": user_id,
-        "amount": float(amount) 
+        "amount": float(amount),
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call(queue="payment_queue", action="add_funds", payload=payload)
     return await handle_rpc_response(result)
@@ -139,17 +166,22 @@ async def add_credit_to_user(user_id, amount):
 
 @app.route("/payment/pay/<user_id>/<amount>", methods=["POST"])
 async def payment_pay(user_id, amount): 
+    idempotency_key = ensure_idempotency_key()
     payload = {
         "user_id": user_id,
-        "amount": float(amount) 
+        "amount": float(amount),
+        "idempotency_key": idempotency_key
     }
     result = await rpc_client.call(queue="payment_queue", action="pay", payload=payload)
     return await handle_rpc_response(result)
 
 @app.route(("/payment/create_user"), methods=["POST"])
 async def create_user():
+    idempotency_key = ensure_idempotency_key()
     result = await rpc_client.call(queue="payment_queue",
-                                           action="create_user")
+                                    action="create_user",
+                                    payload={"idempotency_key": idempotency_key}
+                                    )
     return await handle_rpc_response(result)
 
 @app.route("/payment/find_user/<user_id>", methods=["GET"])

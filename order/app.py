@@ -27,7 +27,6 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort
 import warnings
 
-from global_idempotency.helper import check_idempotency_key, IdempotencyStoreConnectionError, idempotency_db_conn
 import redis.asyncio as redis
 from redis.asyncio.sentinel import Sentinel 
 # from redis import exceptions as redisexceptions
@@ -61,11 +60,20 @@ sentinel_async = Sentinel([
 
 
 db_master = sentinel_async.master_for('order-master', decode_responses=False)
+db_slave = sentinel_async.slave_for('order-master', socket_timeout=10, decode_responses=False)
+db_master_saga = sentinel_async.master_for('saga-master', socket_timeout=10, decode_responses=False)
+db_slave_saga = sentinel_async.slave_for('saga-master', socket_timeout=10, decode_responses=False)
 
+#changed.. now saga master is used for idempotency as centralized client
+# Read connection details from environment variables
 
-db_slave = sentinel_async.slave_for('order-master', socket_timeout=1, decode_responses=False)
-db_master_saga = sentinel_async.master_for('saga-master', socket_timeout=1, decode_responses=False)
-db_slave_saga = sentinel_async.slave_for('saga-master', socket_timeout=1, decode_responses=False)
+idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)) 
+idempotency_redis_client = sentinel_async.master_for(
+    "saga-master",
+    decode_responses=False,
+    db=idempotency_redis_db
+)
+
 SERVICE_ID = str(uuid.uuid4())
 ORCHESTRATOR_ID = str(uuid.uuid4())
 AMQP_URL = os.environ.get('AMQP_URL', 'amqp://user:password@rabbitmq:5672/')
@@ -126,7 +134,7 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
                 }
                 outbox_msg_json = json.dumps(message)
 
-            async with db_master.pipeline(transaction=True) as pipe:
+            async with db_master_saga.pipeline(transaction=True) as pipe:
                 await pipe.watch(saga_key)
 
                 await pipe.set(saga_key, json.dumps(saga_data))
@@ -149,12 +157,12 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
     logger.critical("f[SAGA UPDATE] Failed after {max_attempts} attempts for {saga_id}.")
     return False
 
-def close_db_connection():
-    logger.info("Closing DB connections")
-    db_master.close()
-    db_slave.close()
-    db_master_saga.close()
-    db_slave_saga.close()
+async def close_db_connection():
+    await db_master.close()
+    await db_slave.close()
+    await db_master_saga.close()
+    await db_slave_saga.close()
+    await idempotency_redis_client.close()
 
 atexit.register(close_db_connection)
 
@@ -245,6 +253,7 @@ async def connect_rpc_client():
 
 
 @worker.register
+@idempotent('create_order', idempotency_redis_client, SERVICE_NAME)
 async def create_order(data, message):
    
     # user_id = data.get("user_id")
@@ -290,6 +299,7 @@ async def find_order(data, message):
     }, 200 # Return 200 for success
 
 @worker.register
+@idempotent('process_checkout_request', idempotency_redis_client, SERVICE_NAME)
 async def process_checkout_request(data, message):
     """
         Receives 'order.checkout' events to begin the saga.
@@ -300,19 +310,6 @@ async def process_checkout_request(data, message):
         saga_id = str(uuid.uuid4())  
         attempt_id = str(message.delivery_tag) if message else str(uuid.uuid4())
         logger.info(f"[Order Orchestrator] Received checkout request for order {order_id}, . Saga ID: {saga_id}")
-
-        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, "checkout", data.get("user_id"), order_id, attempt_id) 
-        # idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME,data.get("user_id"),order_id,saga_id)
-        try:
-            if check_idempotency_key(idempotency_key): #TODO should be async
-            # if await check_idempotency_key(idempotency_key): #TODO should be async
-               app.logger.info(f"[IDEMPOTENCY] Duplicate add stock for {idempotency_key}")
-               return
-        except IdempotencyStoreConnectionError as e:
-            app.logger.error(str(e))
-            return {"msg": "Redis error during idempotency check"}, 500
-        response_data = {"status": "success", "step": "checkout"}
-        global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
 
         await update_saga_and_enqueue(
             saga_id,
@@ -420,6 +417,7 @@ async def process_checkout_request(data, message):
                 return {"error": str(e)}, 500
 
 @worker.register
+@idempotent('process_stock_completed', idempotency_redis_client, SERVICE_NAME)
 async def process_stock_completed(data, message):
     """
           Receives 'stock.reservation_completed' event after Stock Service reserves items.
@@ -429,15 +427,10 @@ async def process_stock_completed(data, message):
         saga_id = data.get('saga_id')
         order_id = data.get('order_id')
         
-        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, 
-                                                                             "stock", order_id, saga_id,
-                                                                             "process_stock_completed")
-
-        # if await check_idempotency_key(idempotency_key):
-        if check_idempotency_key(idempotency_key): #TODO make async
-            logger.info(f"[IDEMPOTENCY] Skipping duplicate stock step for {idempotency_key}")
-            return
-
+        if not saga_id:
+            logger.error(f"no saga_id in process_stock_completed")
+            return {"error": "no saga_id in process_stock_completed"}, 400
+        
         logger.info(f"[Order Orchestrator] Stock reservation completed for saga={saga_id}, order={order_id}")
         # update_saga_state(saga_id, "STOCK_RESERVATION_COMPLETED")
 
@@ -473,13 +466,13 @@ async def process_stock_completed(data, message):
             routing_key="payment_queue",
             payload=payload,
         )
-        # TODO: Probably only the last message should have a callback_action???
-        worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
-                            action="remove_credit", reply_to="orchestrator_queue",
-                            callback_action="process_payment_completed")
-        response_data = {"status": "success", "step": "stock reservation completed"}
-        global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
-        return
+        # # TODO: Probably only the last message should have a callback_action???
+        # worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
+        #                     action="remove_credit", reply_to="orchestrator_queue",
+        #                     callback_action="process_payment_completed")
+        # response_data = {"status": "success", "step": "stock reservation completed"}
+        # global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
+        return {"status": "success", "step": "stock reservation completed"}, 200
 
     except Exception as e:
         logger.error(f"Error in process_stock_completed: {str(e)}")
@@ -501,6 +494,7 @@ async def process_stock_completed(data, message):
 
 
 @worker.register
+@idempotent('process_payment_completed', idempotency_redis_client, SERVICE_NAME)
 async def process_payment_completed(data, message):
     """
       Receives 'payment.completed' after the Payment Service finishes charging.
@@ -509,14 +503,6 @@ async def process_payment_completed(data, message):
     try:
         saga_id = data.get("saga_id")
         order_id = data.get("order_id")
-        idempotency_key = global_idempotency.helper.generate_idempotency_key(SERVICE_NAME, "payment", order_id, saga_id,
-                                                                             "process_payment_completed")
-
-        # if await check_idempotency_key(idempotency_key):
-        if check_idempotency_key(idempotency_key): #TODO make async
-            logger.info(f"[IDEMPOTENCY] Skipping duplicate payment step for {idempotency_key}")
-            return {"msg": "Skipping duplicate payment step "}, 200
-        
 
         logger.info(f"[Order Orchestrator] Payment completed for saga={saga_id}, order={order_id}")
         await update_saga_and_enqueue(
@@ -589,11 +575,10 @@ async def process_payment_completed(data, message):
             "order_id": order_id,
             "status": "success"
         }
-        worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id,
-                            action="checkout_completed", reply_to="gateway_queue")
+        # worker.send_message(payload=payload, queue="order_queue", correlation_id=saga_id,
+                            # action="checkout_completed", reply_to="gateway_queue")
         response_data = {"status": "success", "step": "payment completed"}
-        response_data=global_idempotency.helper.store_idempotent_result(idempotency_key, response_data)
-        return
+        return response_data, 200
 
     except Exception as e:
         logger.error(f"Error in process_payment_completed: {str(e)}")
@@ -624,7 +609,7 @@ async def process_payment_completed(data, message):
                 logger.exception(f"[SAGA] Critical error: {str(e)}", exec_info=True)
                 raise
 
-
+@idempotent('process_failure_events', idempotency_redis_client, SERVICE_NAME)
 async def process_failure_events(data, message):
     """
     Any service can publish a failure event: e.g. 'stock.reservation_failed' or 'payment.failed'.
@@ -731,7 +716,7 @@ def send_post_request(url: str):
 #TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
 
 @worker.register
-@idempotent("add_item",idempotency_db_conn,SERVICE_NAME)
+@idempotent("add_item",idempotency_redis_client,SERVICE_NAME)
 async def add_item(data, message):
     order_id = data.get("order_id")
     item_id = data.get("item_id")

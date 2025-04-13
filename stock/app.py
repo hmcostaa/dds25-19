@@ -44,16 +44,23 @@ sentinel_async = Sentinel([
 db_master=sentinel_async.master_for('stock-master',  decode_responses=False)
 db_slave=sentinel_async.slave_for('stock-master',  decode_responses=False)
 
-#no slave since idempotency is critical to payment service
-idempotency_db_conn = db_master 
+#changed.. now saga master is used for idempotency as centralized client
+# Read connection details from environment variables
+
+idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)) 
+idempotency_redis_client = sentinel_async.master_for(
+    "saga-master",
+    decode_responses=False,
+    db=idempotency_redis_db
+)
 
 logger.info("Connected to idempotency (Stock) Redis.")
 
 
-def close_db_connection():
-    db_master.close()
-    db_slave.close()
-    idempotency_db_conn.close()
+async def close_db_connection():
+    await db_master.close()
+    await db_slave.close()
+    await idempotency_redis_client.close()
 
 atexit.register(close_db_connection)
 
@@ -151,6 +158,7 @@ async def atomic_update_item(item_id: str, update_func):
     return None, f"Failed to update item, retries nr??."
 
 @worker.register
+@idempotent('create_item', idempotency_redis_client, SERVICE_NAME) #not sure if idempotent or not TODO
 async def create_item(data, message):
     price = data.get("price")
     try:
@@ -194,7 +202,7 @@ async def find_item(data, message):
             "price": item_entry.price } , 200
 
 @worker.register
-@idempotent('add_stock', idempotency_db_conn, SERVICE_NAME)
+@idempotent('add_stock', idempotency_redis_client, SERVICE_NAME)
 async def add_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
@@ -246,7 +254,7 @@ async def add_stock(data, message):
         return ({"paid": False, "internal error": error_msg}, 400)
 
 @worker.register
-@idempotent('remove_stock', idempotency_db_conn, SERVICE_NAME)
+@idempotent('remove_stock', idempotency_redis_client, SERVICE_NAME)
 async def remove_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")

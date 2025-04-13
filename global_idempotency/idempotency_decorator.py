@@ -4,10 +4,19 @@ import redis.asyncio as redis
 from redis.asyncio.sentinel import Sentinel 
 from msgspec import msgpack, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
 from typing import Tuple, Any, Dict
+import hashlib
+import json
+import logging
 
 logger = logging.getLogger("idempotency_deco")
 
 IDEMPOTENT_KEY_TTL = 86400 * 7
+
+SERVICE_CONTEXT = {
+    "payment": "user_id",
+    "stock": "item_id",
+    "order": "order_id",
+}
 
 #helps debugging later on
 class IdempotencyStoreConnectionError(Exception):
@@ -24,124 +33,117 @@ class IdempotencyStoreConnectionError(Exception):
 
 IdempotencyResultTuple = Tuple[Dict[str, Any], int]
 
+def create_hash(payload: dict, exclude_keys: set = None) -> str:
+    if exclude_keys is None:
+        exclude_keys = {'attempt_id', 'order_id', 'user_id', 'item_id'}
+    
+    #exclude metadata since two duplicates that should perform the same operation can have different metadata
+    relevant = {keys: values for keys, values in payload.items() if keys not in exclude_keys and values is not None}
+    if not relevant:
+        return "backup_payload_hash_not_relevant"
+    
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
 def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(data: dict, *args, **kwargs):
-            user_id = data.get("user_id")  # payment
-            item_id = data.get("item_id")  # stock
-            order_id = data.get("order_id")
-            attempt_id = data.get("attempt_id")
-            amount = data.get("amount")
-
-            if not order_id or not attempt_id:
-                logger.warning(f"'{operation_name}' called without order_id or attempt_id. Skipping idempotency check.")
-                return await func(data, *args, **kwargs)
-
-            key_parts = None #now initialized
-            skippable = False
-
-            if order_id and attempt_id:
-                if service_name == "payment" and user_id:
-                    key_parts = [service_name, operation_name, user_id, order_id, attempt_id]
-                elif service_name == "stock" and item_id:
-                    key_parts = [service_name, operation_name, item_id, order_id, attempt_id]
-                else:
-                    key_parts = [service_name, operation_name, order_id, attempt_id]
-
-            elif service_name == "payment" and operation_name == "pay" and user_id and amount is not None:
-                #payment does not have order_id and attempt_id
-                key_parts = [service_name, operation_name, user_id, str(amount)]
-            else:
-                logger.warning(f"Unknown service name {service_name} or operation name {operation_name}")
-                skippable = True
+            #improved idempotency key to not rely on some of the values since they are not consistent for each service
+            unique_key: str | None = data.get("idempotency_key")
             
-            if skippable:
-                return await func(data, *args, **kwargs)
-                # call the function without idempotency
+            if not unique_key:
+                #fallback, shouldnt occur
+                logger.warning(f"No idempotency key found in service name {service_name} or operation name {operation_name}")
+                idempotency_key_falback = data.get("idempotency_key")
+                if idempotency_key_falback:
+                    unique_key = idempotency_key_falback
+                else:
+                    #last resort
+                    order_id = data.get("order_id")
+                    attempt_id = data.get("attempt_id")
+                    if order_id and attempt_id:
+                        unique_key = f"saga:{order_id}:{attempt_id}"
+                        logger.debug(f"Falling back to last resot saga unique key: {unique_key}")
 
-            redis_key = f"idempotency:{':'.join(str(p) for p in key_parts)}"
+            if not unique_key:
+                #if even that fails, return error
+                logger.error(f"No idempotency key found in service name {service_name} or operation name {operation_name}")
+                return {"error": "Idempotency error - no key found"}, 500
+            
+            context_key = SERVICE_CONTEXT.get(service_name)
+            context_id =data.get(context_key) if context_key else "no_context" 
+            if not context_key and context_id:
+                context_id = "no_context"
 
-            logger.debug(f"Using idempotency key: {redis_key}")
+            created_hash = create_hash(data, exclude_keys={"idempotency_key", "order_id", "attempt_id", context_key})
 
-            stored_data = None
+            redis_key = f"idempotency:{service_name}:{operation_name}:{context_id}:{unique_key}:{created_hash}"
+            logger.debug(f"Idempotency Check - Key: {redis_key}")
+
+            #maybe cache??
+            #store cache here potentially TODO
+            #cache miss
             try:
-                stored_data = await redis_client.get(redis_key)
-                if stored_data:
-                    logger.info(f"Idempotency hit for key {redis_key}. Returning stored result.")
+                cache_bytes = await redis_client.get(redis_key)
+                if cache_bytes:
+                    logger.info(f"Cache hit for key {redis_key}")
                     try:
-                        stored_result = msgpack.decode(stored_data, type=IdempotencyResultTuple)
-                        return stored_result
-                    except IdempotencyDataError as e:
-                         logger.error(f"ocrrupted idempotency data for key {redis_key}: {e}")
-                        #  return {"error": "internal idempotency data error"}, 500
+                        result_tuple = msgpack.decode(cache_bytes)
+                        return result_tuple
+                    except MsgspecDecodeError as e:
+                        logger.error(f"Error decoding cache_bytes for key {redis_key}: {e}")
+                        return {"error": "Idempotency internal error"}, 500
+                else:
+                    logger.debug(f"Cache miss for key {redis_key}")
+                
+                    result_tuple: IdempotencyResultTuple | None = None
+                    try:
+                        logger.debug(f"Original function: {func.__name__}")
+                        result_tuple = await func(data, *args, **kwargs)
 
-            except redis.exceptions.ConnectionError as e:
-                logger.error(f"redis connection error during idempotency check: {e}")
-                # return {"error": "idempotency store unavailable"}, 503
+                        if not (isinstance(result_tuple, tuple) and len(result_tuple) == 2 and isinstance(result_tuple[1], int)):
+                            logger.error(f"Decorated function '{func.__name__}' returned invalid result_tuple : {type(result_tuple)}. Expected (dict, int).")
+                            raise 
+                        
+                        logger.debug(f"Decorated function '{func.__name__}' returned result tuple: {result_tuple}")
+                    except Exception as e:
+                        logger.error(f"Error in idempotency decorator: {str(e)}")
+                        status_code = 500
+                        if isinstance(e, ValueError):
+                            status_code = 400
+                        
+                        result_tuple = ({"error": str(e)}, status_code)
+                
+                    try:
+                        bytes = msgpack.encode(result_tuple)
+                        bytes_were_set = await redis_client.set(redis_key, bytes, nx=True, ex=IDEMPOTENT_KEY_TTL)
+                        if bytes_were_set:
+                            logger.info(f"Stored idempotency result for key {redis_key}")
+                        else:
+                            #race conition, retry
+                            await asyncio.sleep(0.05)
+                            retry_bytes = await redis_client.get(redis_key)
+                            if retry_bytes:
+                                try:
+                                    result_tuple = msgpack.decode(retry_bytes)
+                                    logger.info(f"Successfully retrieved idempotency result for key {redis_key}")
+                                except (MsgspecDecodeError, TypeError) as e:
+                                    logger.error(f"Error decoding idempotency result for key {redis_key}: {e}")
+                                    logger.warning("Falling back to original redis key: {redis_key}")
+                            else:
+                                logger.debug(f"refetch failed for key {redis_key}")
+                    except (MsgspecEncodeError, TypeError, ValueError) as e:
+                        logger.error(f"error encoding result tuple for key {redis_key}: {e}")
+                        return {"error": "Idempotency error"}, 500
+                    except redis.exceptions.RedisError as e:
+                        logger.erro(f"Redis error storing result tuple for key {redis_key}: {e}")
+                        return {"error": "Idempotency store error"}, 503
+                    
+                    return result_tuple
             
             except redis.exceptions.RedisError as e:
-                logger.error(f"redis connection error during idempotency check: {e}")
-                # return {"error": "idempotency store unavailable/error"}, 503
-
-            try:
-                result_tuple: IdempotencyResultTuple= await func(data, *args, **kwargs)
-                logger.debug(f"operation for key {redis_key} executed. Result: {result_tuple}")
-
-                if not (isinstance(result_tuple, tuple) and len(result_tuple) == 2 and isinstance(result_tuple[1], int)):
-                    logger.warning(f"idempotency result tuple is not a tuple of length 2: {result_tuple}")
-                    return result_tuple
-                
+                logger.error(f"Redis error getting cache_bytes for key {redis_key}: {e}")
+                return {"error": "Idempotency error"}, 503
             except Exception as e:
-                logger.error(f"Error in idempotency decorator: {str(e)}")
-                return e
-
-            except (redis.exceptions.ConnectionError, redis.exceptions.RedisError) as e:
-                 # extra redis error handling
-                 logger.critical(f"FAILED to store idempotency result for {redis_key}: {e}")
-                 # have to decide --> return the computed result anyway, or an error?
-                 # result-> risks non-idempotency on retry if storage failed.
-                 # error --> might be safer but could cause NACK/retry loops if the operation *did* succeed.
-                 # check again later
-                 if result_tuple:
-                     return result_tuple
-                 else:
-                      return {"error": f"Redis error during idempotency storage: {str(e)}"}, 503
-            except IdempotencyDataError as e:
-                 logger.critical(f"FAILED to serialize idempotency result for {redis_key}: {e}")
-                 if result_tuple:
-                     return result_tuple # storage failed
-                 else:
-                      return {"error": f"Serialization error during idempotency storage: {str(e)}"}, 500
-
-            except Exception as e:
-                logger.exception(f"Error during execution of wrapped function for key {redis_key}: {e}")
-                error_result = ({"error": f"Operation failed: {str(e)}"}, 500) 
-                try:
-                    serialized_error= msgpack.encode(error_result)
-                    if redis_client.set(redis_key, serialized_error, nx=True, ex=IDEMPOTENT_KEY_TTL):
-                         logger.info(f"Stored idempotency failure result for key {redis_key}")
-
-                    else:
-                         logger.warning(f"Idempotency race condition on failure for key {redis_key}")
-                    
-                    return error_result 
-                except Exception as store_e:
-                     logger.critical(f"FAILED to store idempotency failure result for {redis_key}: {store_e}")
-                     return error_result
-                
-            try:
-                #now actually storing async 
-                result_bytes = msgpack.encode(result_tuple)
-                was_set = await redis_client.set(redis_key, result_bytes, nx=True, ex=IDEMPOTENT_KEY_TTL)
-                if was_set:
-                    logger.info(f"Stored idempotency result for key {redis_key}")
-                else:
-                    logger.warning(f"Idempotency race condition on success for key {redis_key}")
-            except Exception as e:
-                logger.error(f"Error storing idempotency result for key {redis_key}: {str(e)}")
-        
-            return result_tuple
-
+                logger.error(f"Unexpected error  {redis_key}: {e}")
         return wrapper
     return decorator
