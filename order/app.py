@@ -510,15 +510,19 @@ async def process_checkout_request(data, message):
             raise Exception(f"No items to be fetched or reserved for order {order_id}")
         
         logger.info(f"[Order Orchestrator] Sending reserve stock message for saga={saga_id}, order={order_id}")
+        request_idempotency_key=data.get("idempotency_key","")
         for item_id, quantity in items_to_be_reserved:
+            stock_idempotency_key = f"{request_idempotency_key}:{saga_id}:{item_id}:{quantity}"
             payload = {
                 "saga_id": saga_id,
                 "order_id": order_id,
                 "item_id": item_id,
-                "quantity": quantity
+                "amount": quantity,
+                "idempotency_key": stock_idempotency_key,
+
             }
             await worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id,
-                                action="reserve_stock", reply_to="orchestrator_queue",
+                                action="remove_stock", reply_to="orchestrator_queue",
                                 callback_action="process_stock_completed")
 
         return await handle_final_saga_state(
@@ -590,9 +594,12 @@ async def process_stock_completed(data, message):
             raise Exception("Missing user_id or total_cost in saga details")
 
         logger.info(f"[Order Orchestrator] Sending remove_credit request for saga={saga_id}, order={order_id}")
+        payment_idempotency_key = f"{saga_id}:payment:{user_id}:{total_cost}"
+
         payload = {
             "user_id": user_id,
-            "amount": total_cost
+            "amount": total_cost,
+            "idempotency_key": payment_idempotency_key
         }
 
         await update_saga_and_enqueue(
@@ -603,9 +610,9 @@ async def process_stock_completed(data, message):
             payload=payload,
         )
         # # TODO: Probably only the last message should have a callback_action???
-        # worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
-        #                     action="remove_credit", reply_to="orchestrator_queue",
-        #                     callback_action="process_payment_completed")
+        await worker.send_message(payload=payload, queue="payment_queue", correlation_id=saga_id,
+                            action="remove_credit", reply_to="orchestrator_queue",
+                            callback_action="process_payment_completed")
         # response_data = {"status": "success", "step": "stock reservation completed"}
         # global_idempotency.helper.store_idempotent_result(idempotency_key,response_data)
         return {"status": "success", "step": "stock reservation completed"}, 200
@@ -664,9 +671,11 @@ async def process_payment_completed(data, message):
             raise Exception(f"No items to be removed for order {order_id}")
         
         for item_id, quantity in items_to_be_removed:
+            stock_remove_idempotency_key = f"{saga_id}:stock_remove:{item_id}:{quantity}"
             payload = {
                 "item_id": item_id,
-                "quantity": quantity
+                "amount": quantity,
+                "idempotency_key": stock_remove_idempotency_key
             }
             await worker.send_message(payload=payload, queue="stock_queue", correlation_id=saga_id, action="remove_stock")
         
