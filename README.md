@@ -3,6 +3,10 @@
 Basic project structure with Python's Flask and Redis. 
 **You are free to use any web framework in any language and any database you like for this project.**
 
+# System Architecture Summary
+
+The system is composed of three asynchronous services -- Order Service as SAGA Orchestrator, Stock Service, and Payment Service. The Order Service acts as a SAGA Orchestrator. Whenever a failure occurs in the system, the order service will compensate the failed transaction by sending commands to Stock and Payment services via RabbitMQ. Within each service, there is a designated Leader Replica responsible for handling all write operations within that service, ensuring consistency and atomic updates, while other replicas provide high availability to the system and Redis Sentinels provide failover support by automatically promoting a Follower Replica to Leader if the current Leader fails. Data persistence for each service (orders, stock, payments) relies on separate Redis master-replica sets managed by Redis Sentinel for high availability and failover. Consistency is enforced through atomic updates using Redis WATCH/MULTI/EXEC transactions within each service and idempotency keys backed by the shared saga Redis instance.
+
 ### RabbitMQ Management Interface
 http://localhost:15672
 
