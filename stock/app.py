@@ -62,7 +62,7 @@ async def close_db_connection():
     await db_slave.close()
     await idempotency_redis_client.close()
 
-atexit.register(close_db_connection)
+
 
 
 class StockValue(Struct):
@@ -293,6 +293,11 @@ async def remove_stock(data, message):
     except Exception as e:
         logger.exception("Error canceling stock for user %s: %s", item_id, e)
         return {"error": f"Error canceling stock for user {item_id}: {e}"}, 500
-        
+
+async def main():
+    try:
+        await worker.start()
+    finally:
+        await close_db_connection()
 if __name__ == '__main__':
-    asyncio.run(worker.start())
+    asyncio.run(main())

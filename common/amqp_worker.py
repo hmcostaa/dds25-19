@@ -244,7 +244,7 @@ class AMQPWorker:
 
         correlation_id = correlation_id or str(uuid.uuid4())
 
-        await exchange.default_exchange.publish(
+        await exchange.publish(
             Message(
                 body=json.dumps(payload).encode(),
                 correlation_id=correlation_id,

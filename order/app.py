@@ -7,20 +7,13 @@ import uuid
 import asyncio
 import time
 
-from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError
-import aio_pika
 from aiohttp import web
-from aio_pika import connect_robust, Message, DeliveryMode, RobustConnection, RobustChannel, RobustExchange
-from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
-from typing import Optional, Tuple, Dict, Any, Union, List
-from global_idempotency.idempotency_decorator import idempotent
-import global_idempotency
+from aio_pika import connect_robust, Message, DeliveryMode
+from msgspec import  DecodeError as MsgspecDecodeError
+from typing import  Tuple, Dict,  Union
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
-import global_idempotency.helper
-# from redis import Sentinel
 
-# import redis
 import requests
 
 from msgspec import msgpack, Struct
@@ -28,9 +21,10 @@ from flask import Flask, jsonify, abort
 import warnings
 
 import redis.asyncio as redis
-from redis.asyncio.sentinel import Sentinel 
-# from redis import exceptions as redisexceptions
+from redis.asyncio.sentinel import Sentinel
 import redis
+
+from global_idempotency.idempotency_decorator import idempotent
 
 warnings.filterwarnings("ignore", message=".*Python 2.7.*")
 
@@ -44,6 +38,7 @@ LOCK_TIMEOUT = 30000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 app = Flask("order-service")
 
@@ -83,6 +78,84 @@ worker = AMQPWorker(
 )
 OUTBOX_KEY="outbox:order"
 
+saga_futures={}
+pubsub_clients={}
+listener_tasks={}
+
+async def cleanup_pubsub_resource():
+    logger.info("Cleaning up Redis PubSub resources.")
+    for saga_id, task in listener_tasks.items():
+        if not task.done():
+            task.cancel()
+    for saga_id, pubsub in pubsub_clients.items():
+        await pubsub.close()
+    saga_futures.clear()
+    pubsub_clients.clear()
+    listener_tasks.clear()
+
+
+
+async def start_pubsub_listener(saga_id: str)->asyncio.Task:
+    notification_channel=f"saga_completion:{saga_id}"
+    pubsub = db_master_saga.pubsub()
+    pubsub_clients[saga_id] = pubsub
+
+    async def listen_for_completion():
+        try:
+            await pubsub.subscribe(notification_channel)
+            logger.info(f"[Pubsub] Subscribed to {notification_channel}")
+            while not saga_futures[saga_id].done():
+                try:
+                  message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
+                  if message and message['type'] == 'message':
+                        data = json.loads(message['data']) if isinstance(message['data'], str) else message['data']
+                        logger.info(f"[PubSub] Received notification for saga {saga_id}: {data}")
+                        completion_data = json.loads(data) if isinstance(data, str) else data
+                        if saga_id in saga_futures and not saga_futures[saga_id].done():
+                               if completion_data.get("success", False):
+                                   saga_futures[saga_id].set_result({"success": True})
+                               else:
+                                 error_msg = completion_data.get("error", "Unknown error")
+                                 saga_futures[saga_id].set_result({"success": False, "error": error_msg})
+                        break
+                  current_saga=await get_saga_state(saga_id)
+                  if current_saga:
+                      status = current_saga.get("status")
+                      if status in["SAGA_COMPLETED", "ORDER_FINALIZED"]:
+                          if saga_id in saga_futures and not saga_futures[saga_id].done():
+                              saga_futures[saga_id].set_result({"success": True})
+                              break
+                      elif status in ["SAGA_FAILED", "SAGA_FAILED_INITIALIZATION",
+                                      "SAGA_FAILED_RECOVERY", "ORDER_FINALIZATION_FAILED","SAGA_FAILED_ORDER_NOT_FOUND"]:
+                          error_details=current_saga.get("details",{}).get("error","Unknown saga failure")
+                          if saga_id in saga_futures and not saga_futures[saga_id].done():
+                              saga_futures[saga_id].set_result({"success": False, "error": error_details})
+                              break
+                  await asyncio.sleep(0.1)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"[PubSub] Error while processing messages: {e}")
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"[PubSub] Listener error for {saga_id}: {e}")
+            if saga_id in saga_futures and not saga_futures[saga_id].done():
+                saga_futures[saga_id].set_exception(e)
+        finally:
+            try:
+                await pubsub.unsubscribe(notification_channel)
+                logger.info(f"[PubSub] Unsubscribed from {notification_channel}")
+                if saga_id in pubsub_clients:
+                    await pubsub_clients[saga_id].close()
+                    del pubsub_clients[saga_id]
+                if saga_id in listener_tasks:
+                    del listener_tasks[saga_id]
+            except Exception as e:
+                logger.error(f"[PubSub] Cleanup error for {saga_id}: {e}")
+    task=asyncio.create_task(listen_for_completion())
+    listener_tasks[saga_id] = task
+    return task
+
 async def handle_final_saga_state(saga_id, request_idempotency_key, final_status, result_payload, status_code):
     logger.info(f"[Order Orchestrator] Handling final saga state for saga {saga_id}")
 
@@ -93,6 +166,37 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
     # pre-checks?? however would not guarantee consistent state return, but is faster
     # adjust test? elaborate ? or show two version for performance difference
     # would be nice, but time constraint
+    saga_data=await get_saga_state(saga_id)
+    if saga_data:
+        current_status=saga_data.get("status")
+        if current_status=="SAGA_COMPLETED":
+            logger.info(f"[Order Orchestrator] Saga {saga_id} already completed successfully")
+            return result_payload, status_code
+        elif current_status in ["SAGA_FAILED","SAGA_FAILED_INITIALIZATION","SAGA_FAILED_ORDER_NOT_FOUND",
+                                "SAGA_FAILED_RECOVERY","ORDER_FINALIZATION_FAILED"]:
+            error_details=saga_data.get("details",{}).get("error","Unknown saga failure")
+            return {"error":error_details},400
+    saga_futures[saga_id]=asyncio.Future()
+    await start_pubsub_listener(saga_id)
+    try:
+        await asyncio.wait_for(saga_futures[saga_id],timeout=15)
+        saga_result=saga_futures[saga_id].result()
+        logger.info(f"[Order Orchestrator] Saga {saga_id} completed with result: {saga_result}")
+        if saga_result.get("success",False):
+            return result_payload, status_code
+
+        else:
+            return {"error": saga_result.get("error", "Unknown saga failure")}, 400
+    except asyncio.TimeoutError:
+        logger.warning(f"[Order Orchestrator] Timed out waiting for saga {saga_id}")
+        return result_payload, status_code
+    finally:
+        # Clean up resources
+        if saga_id in saga_futures:
+            del saga_futures[saga_id]
+
+        if saga_id in listener_tasks and not listener_tasks[saga_id].done():
+            listener_tasks[saga_id].cancel()
 
 async def enqueue_outbox_message(routing_key: str, payload:dict):
     message={
@@ -109,53 +213,65 @@ async def enqueue_outbox_message(routing_key: str, payload:dict):
 async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, payload:dict|None, details=None,max_attempts: int=5,backoff_ms:int=100):
 #retry maybe todo too with max attempts?
     saga_key = f"saga:{saga_id}"
+    notification_channel = f"saga_completion:{saga_id}"
     for attempt in range(max_attempts):
        try:
-            saga_json = await db_slave_saga.get(saga_key)
-            if saga_json:
-                saga_data = json.loads(saga_json)
-            else:
-                # Create a new saga record if not found
-                saga_data = {
-                    "saga_id": saga_id,
-                    "status": status,
-                    "steps": [],
-                    "created_at": time.time()
-                }
-
-            saga_data["status"] = status
-            saga_data["last_updated"] = time.time()
-
-            if details:
+           async with db_master_saga.pipeline(transaction=True) as pipe:
+               await pipe.watch(saga_key)
+               saga_json = await pipe.get(saga_key)
+               if saga_json:
+                   if isinstance(saga_json, bytes):
+                       saga_data = saga_json.decode("utf-8")
+                   saga_data = json.loads(saga_data)
+               else:
+                   saga_data = {
+                       "saga_id": saga_id,
+                       "status": status,
+                       "steps": [],
+                       "created_at": time.time()
+                   }
+               saga_data["status"] = status
+               saga_data["last_updated"] = time.time()
+               if details:
                 saga_data["details"] = {**saga_data.get("details", {}), **details}
-
-            # Append a step entry
-            saga_data["steps"].append({
+                saga_data["steps"].append({
                 "status": status,
                 "timestamp": time.time(),
                 "details": details
             })
-
-            outbox_msg_json = None
-            if payload and routing_key:
-                message={
+               outbox_msg = None
+               if payload and routing_key:
+                 outbox_msg={
                     "routing_key":routing_key,
                     "payload":payload,
                     "timestamp":time.time()
-                }
-                outbox_msg_json = json.dumps(message)
-
-            async with db_master_saga.pipeline(transaction=True) as pipe:
-                await pipe.watch(saga_key)
-
-                await pipe.set(saga_key, json.dumps(saga_data))
-                if outbox_msg_json:
-                    await pipe.rpush(OUTBOX_KEY,outbox_msg_json)
-                
-            result =  await pipe.execute()
-            
-            logger.info(f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox")
-            return True
+                 }
+                 outbox_msg_json = json.dumps(outbox_msg)
+               pipe.multi()
+               await pipe.set(saga_key, json.dumps(saga_data),ex=SAGA_STATE_TTL)
+               if outbox_msg:
+                   await pipe.rpush(OUTBOX_KEY,outbox_msg_json)
+               is_success_terminal = status in ["SAGA_COMPLETED", "ORDER_FINALIZED"]
+               is_failure_terminal = status in ["SAGA_FAILED", "SAGA_FAILED_INITIALIZATION",
+                                                "SAGA_FAILED_RECOVERY", "ORDER_FINALIZATION_FAILED"]
+               if is_success_terminal:
+                   await pipe.publish(notification_channel, json.dumps({"success":True}))
+               elif is_failure_terminal:
+                   error_msg = details.get("error", "Unknown error") if details else "Unknown error"
+                   await pipe.publish(notification_channel, json.dumps({"success": False, "error": error_msg}))
+               results=await pipe.execute()
+               logger.info(f"[Order Orchestrator] Saga {saga_id} updated -> {status}")
+               if (is_success_terminal or is_failure_terminal) and saga_id in saga_futures:
+                   future=saga_futures[saga_id]
+                   if not future.done():
+                       if is_success_terminal:
+                           future.set_result({"success":True})
+                       else:
+                         error_msg = details.get("error", "Unknown error") if details else "Unknown error"
+                         future.set_result({"success": False, "error": error_msg})
+               logger.info(
+                   f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox")
+               return True
        except redis.exceptions.WatchError:
            logger.warning(f"[SAGA UPDATE] Retry {attempt+1}/{max_attempts}. Saga {saga_id} failed to update. WatchError on {saga_id}")
        except redis.exceptions.RedisError as e:
@@ -173,9 +289,10 @@ async def close_db_connection():
     await db_slave.close()
     await db_master_saga.close()
     await db_slave_saga.close()
+    await cleanup_pubsub_resource()
     await idempotency_redis_client.close()
 
-atexit.register(close_db_connection)
+
 
 
 class OrderValue(Struct):
@@ -244,6 +361,8 @@ async def get_saga_state(saga_id: str) -> str:
         saga_key = f"saga:{saga_id}"
         saga_json = await db_slave_saga.get(saga_key)
         if saga_json:
+            if isinstance(saga_json, bytes):
+                saga_json = saga_json.decode('utf-8')
             return json.loads(saga_json)
         logger.warning(f"[Order Orchestrator] Saga {saga_id} not found.")
         return None
@@ -281,7 +400,14 @@ async def create_order(data, message):
         await db_master.set(key, value)
 
         await update_saga_and_enqueue(saga_id=key, status="INITIATED", routing_key=None, payload=None)
-        return {"order_id": key}, 200
+        # return {"order_id": key}, 200
+        return await handle_final_saga_state(
+            saga_id=key,
+            request_idempotency_key=data.get("idempotency_key", ""),
+            final_status="INITIATED",
+            result_payload={"order_id": key},
+            status_code=200
+        )
     
     except redis.RedisError:
         logger.error(f"Redis error creating order {key} for user {user_id}: {e}")
@@ -395,7 +521,13 @@ async def process_checkout_request(data, message):
                                 action="reserve_stock", reply_to="orchestrator_queue",
                                 callback_action="process_stock_completed")
 
-        return {"status": "success", "step": "stock reservation initiated"}
+        return await handle_final_saga_state(
+            saga_id=saga_id,
+            request_idempotency_key=data.get("idempotency_key",""),
+            final_status="SAGA_STARTED",
+            result_payload={"status": "success", "step": "stock reservation initiated"},
+            status_code=200
+        )
 
     except Exception as e:
         logger.error(f"Error in process_checkout_request: {str(e)}")
@@ -713,14 +845,14 @@ async def process_failure_events(data, message):
             logger.error(f"Error nacking message: {str(e)}")
 
 
-#TODO potentially blocking and synchronous
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        return {"error": "Request error"}, 400
-    else:
-        return response
+# #TODO potentially blocking and synchronous
+# def send_post_request(url: str):
+#     try:
+#         response = requests.post(url)
+#     except requests.exceptions.RequestException:
+#         return {"error": "Request error"}, 400
+#     else:
+#         return response
 
 
 #TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
@@ -792,7 +924,15 @@ async def add_item(data, message):
                 payload=None,
                 details={"item_id": item_id, "quantity": quantity}
             )
-            return {"data": {"added": True, "order_id": order_id, "new_total_cost": updated_order.total_cost}}, 200
+            # return {"data": {"added": True, "order_id": order_id, "new_total_cost": updated_order.total_cost}}, 200
+            return await handle_final_saga_state(
+                saga_id=order_id,
+                request_idempotency_key=data.get("idempotency_key", ""),
+                final_status="ITEM_ADDED",
+                result_payload={
+                    "data": {"added": True, "order_id": order_id, "new_total_cost": updated_order.total_cost}},
+                status_code=200
+            )
         else:
             return ({"added": False, "error": "Internal processing error"}, 500)
     except ValueError as e:
@@ -949,14 +1089,6 @@ async def force_release_locks(order_id: str) -> bool:
     except Exception as e:
         logger.error(f"Error while releasing lock for order: {order_id}: {str(e)}")
         return False
-
-
-
-
-
-# ----------------------------------------------------------------------------
-# Saga State Helpers
-# ----------------------------------------------------------------------------
 
 async def publish_event(routing_key, payload):
     """
@@ -1153,11 +1285,6 @@ async def outbox_poller():
             logger.error(f"Error publishing event: {str(e)}", exc_info=True)
             await asyncio.sleep(5)
 
-
-
-# ----------------------------------------------------------------------------
-# Optional Health Check
-# ----------------------------------------------------------------------------
 async def health_check_server():
     """
     Runs a simple HTTP server on port 8000 to respond with 'OK' for readiness checks.
@@ -1177,13 +1304,17 @@ async def health_check_server():
 
 
 async def main():
+   try:
     await connect_rpc_client()
     asyncio.create_task(health_check_server())
     asyncio.create_task(consume_messages())
     asyncio.create_task(maintain_leadership())
     asyncio.create_task(recover_in_progress_sagas())
     asyncio.create_task(outbox_poller())
+
     await worker.start()
+   finally:
+       await close_db_connection()
 
 if __name__ == '__main__':
    asyncio.run(main())

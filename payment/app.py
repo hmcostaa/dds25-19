@@ -6,6 +6,7 @@ import sys
 import uuid
 import asyncio
 import redis.asyncio as redis
+from quart import app
 from redis.asyncio.sentinel import Sentinel 
 from flask import Flask, jsonify, abort, Response
 from typing import Optional, Tuple, Any, Union, Tuple, Dict
@@ -73,7 +74,8 @@ async def close_db_connection():
 
 
 
-atexit.register(close_db_connection)
+
+
 
 
 class UserValue(Struct):
@@ -357,7 +359,12 @@ async def compensate(data, message):
     except Exception as e:
         logging.exception("Error canceling payment for user %s: %s", user_id, e)
         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
-    
+
+async def main():
+    try:
+        await worker.start()
+    finally:
+        await close_db_connection()
 if __name__ == '__main__':
     logging.info("Starting payment service AMQP worker...")
-    asyncio.run(worker.start())
+    asyncio.run(main())
