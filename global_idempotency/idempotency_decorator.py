@@ -1,4 +1,3 @@
-import asyncio
 import functools
 import logging
 import redis.asyncio as redis
@@ -8,7 +7,7 @@ from typing import Tuple, Any, Dict
 import hashlib
 import json
 import logging
-
+import asyncio
 logger = logging.getLogger("idempotency_deco")
 
 IDEMPOTENT_KEY_TTL = 86400 * 7
@@ -43,7 +42,10 @@ def create_hash(payload: dict, exclude_keys: set = None) -> str:
     if not relevant:
         return "backup_payload_hash_not_relevant"
     
-    return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
+    hash_value = hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()
+    
+    logger.debug(f"[IDEMPOTENCY:HASH] Created hash: {hash_value} ")
+    return hash_value
 def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str):
     def decorator(func):
         @functools.wraps(func)
@@ -87,8 +89,27 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
                 cache_bytes = await redis_client.get(redis_key)
                 if cache_bytes:
                     logger.info(f"Cache hit for key {redis_key}")
-                    try:
-                        result_tuple = msgpack.decode(cache_bytes)
+                    try: 
+                        decoded_result = msgpack.decode(cache_bytes)
+                        result_tuple = None 
+
+                        if isinstance(decoded_result, list) and len(decoded_result) == 2:
+                            result_tuple = tuple(decoded_result)
+                            logger.debug(f"Converted decoded list to tuple for cache hit: {redis_key}")
+                        elif isinstance(decoded_result, tuple) and len(decoded_result) == 2:
+                            result_tuple = decoded_result 
+
+                        if not (result_tuple and
+                                isinstance(result_tuple[0], dict) and
+                                isinstance(result_tuple[1], int)):
+                            if result_tuple: 
+                                 logger.error(f"Cached data structure has invalid element types for key {redis_key}: ({type(result_tuple[0])}, {type(result_tuple[1])})")
+                                 raise IdempotencyDataError(f"Invalid element types in cached data for key {redis_key}")
+                            else: 
+                                logger.error(f"Unexpected data structure decoded from cache for key {redis_key}: {type(decoded_result)}")
+                                raise IdempotencyDataError(f"Unexpected data structure in cache for key {redis_key}")
+
+                        logger.debug(f"Returning successfully processed cached result tuple for key {redis_key}")
                         return result_tuple
                     except MsgspecDecodeError as e:
                         logger.error(f"Error decoding cache_bytes for key {redis_key}: {e}")
@@ -135,13 +156,13 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
                     except (MsgspecEncodeError, TypeError, ValueError) as e:
                         logger.error(f"error encoding result tuple for key {redis_key}: {e}")
                         return {"error": "Idempotency error"}, 500
-                    except redis.RedisError as e:
+                    except redis.exceptions.RedisError as e:
                         logger.erro(f"Redis error storing result tuple for key {redis_key}: {e}")
                         return {"error": "Idempotency store error"}, 503
                     
                     return result_tuple
             
-            except redis.RedisError as e:
+            except redis.exceptions.RedisError as e:
                 logger.error(f"Redis error getting cache_bytes for key {redis_key}: {e}")
                 return {"error": "Idempotency error"}, 503
             except Exception as e:

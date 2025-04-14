@@ -13,7 +13,7 @@ from typing import Optional, Tuple, Any, Union, Tuple, Dict
 from redis.exceptions import WatchError, RedisError
 import random
 import logging
-
+import time
 from global_idempotency.idempotency_decorator import idempotent
 
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
@@ -328,55 +328,84 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
     updated_user, error_msg = await atomic_update_user(user_id, updater)
 
     if error_msg:
+        logging.error(f"[PAYMENT] Failed to update user: {error_msg}")
+        
         if saga_id and order_id:
+            logging.info(f"[PAYMENT] Preparing failure notification for saga_id={saga_id}, order_id={order_id}")
             try:
+                reply_to_queue = getattr(message, "reply_to", "orchestrator_queue")
+                if not reply_to_queue:
+                    reply_to_queue = "orchestrator_queue"
+                    logging.warning(f"[Payment Saga] Reply to queue not provided, using default: {reply_to_queue}")
+                else:
+                    logging.info(f"[PAYMENT] Reply to queue provided: {reply_to_queue}")
 
+                logging.debug(f"[PAYMENT] Constructing failure payload for saga_id={saga_id}")
+                failure_payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "error": error_msg,
+                    "success": False,
+                    "callback_action": callback_action or "process_payment_completed"  
+                }
+                logging.debug(f"[PAYMENT] Failure payload: {failure_payload}")
+
+                logging.info(f"[PAYMENT] Sending failure message to queue={reply_to_queue}, correlation_id={saga_id}")
                 await worker.send_message(
-                    payload={
-                        "saga_id": saga_id,
-                        "order_id": order_id,
-                        "error": error_msg,
-                        "success": False,
-                        "callback_action": callback_action or "process_payment_completed"  # Use provided or default
-                    },
-                    queue="orchestrator_queue",
+                    payload=failure_payload,
+                    queue=reply_to_queue,
+                    correlation_id=saga_id,
+                    action="process_payment_completed",
+                    callback_action="process_payment_completed",
+                    reply_to=reply_to_queue
+                )
+                logging.info(f"[Payment] Sent payment failure notification for saga {saga_id}")
+            except Exception as e:
+                logging.error(f"[Payment] Failed to send failure notification: {e}")
+        return ({"error": error_msg}, 400)
+
+
+    if updated_user:
+        if saga_id and order_id and getattr(message, "reply_to", None):
+            try:
+                reply_to_queue = message.reply_to
+                logging.debug(f"[PAYMENT] Constructing direct success payload for saga_id={saga_id}")
+                direct_success_payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "success": True,
+                    "credit": updated_user.credit,
+                    "callback_action": callback_action or "process_payment_completed"
+                }
+                logging.debug(f"[PAYMENT] Direct success payload: {direct_success_payload}")
+                
+                logging.info(f"[PAYMENT] Sending direct success message to queue={reply_to_queue}, correlation_id={saga_id}")
+                await worker.send_message(
+                    payload=direct_success_payload,
+                    queue=reply_to_queue,
                     correlation_id=saga_id,
                     action="process_payment_completed",
                     callback_action="process_payment_completed",
                     reply_to=None
                 )
-                logging.info(f"[Payment] Sent payment failure notification for saga {saga_id}")
+                logging.info(f"[Payment] Sent direct payment completion notification for saga {saga_id}")
             except Exception as e:
-                logging.error(f"[Payment] Failed to send failure notification: {e}")
-        return {"error": error_msg}, 400
+                logging.error(f"[Payment] Failed to send direct success notification: {e}")
 
+        success_data = {
+            "message": f"Removed {amount} from user {user_id}",
+            "credit": updated_user.credit,
+            "saga_id": saga_id,  
+            "order_id": order_id,
+            "callback_action": callback_action or "process_payment_completed"
+        }
+        return (success_data, 200) 
+    else:
+        error_data = {"error": "Failed to update user, unknown reason"}
+        if saga_id: error_data["saga_id"] = saga_id
+        if order_id: error_data["order_id"] = order_id
+        return (error_data, 500)
 
-    if saga_id and order_id:
-        try:
-
-            response_payload = {
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "success": True,
-                "remaining_credit": updated_user.credit,
-                "callback_action": callback_action or "process_payment_completed"
-
-            }
-
-            logging.info(f"[Payment] Sending payment completion notification with payload: {response_payload}")
-
-            await worker.send_message(
-                payload=response_payload,
-                queue="orchestrator_queue",
-                correlation_id=saga_id,
-                action="process_payment_completed",
-                callback_action="process_payment_completed"
-            )
-            logging.info(f"[Payment] Sent payment completion notification for saga {saga_id}")
-        except Exception as e:
-            logging.error(f"[Payment] Failed to send success notification: {e}")
-
-    return {"msg": f"Removed {amount} from user {user_id}"}, 200
 @worker.register
 @idempotent('compensate', idempotency_redis_client, SERVICE_NAME)
 async def compensate(data, message):

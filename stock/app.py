@@ -71,13 +71,11 @@ class StockValue(Struct):
 
 async def get_item_from_db(item_id: str) -> Tuple[Union[StockValue, str], int]:
     # get serialized data
-    print(f"--- STOCK: get_item_from_db - Getting item_id={item_id} from DB ---")
     logger.info(f"--- STOCK: get_item_from_db - Getting item_id={item_id} from DB ---")
     try:
         entry: bytes = await db_slave.get(item_id)
     except redis.exceptions.RedisError:
         return DB_ERROR_STR, 400
-    print(f"--- STOCK: get_item_from_db - Decoded entry type={type(entry)}, value='{str(entry)[:100]}...' ---")
     logger.info(f"--- STOCK: get_item_from_db - Decoded entry type={type(entry)}, value='{str(entry)[:100]}...' ---")
     # deserialize data if it exists else return null
     if entry is None:
@@ -164,9 +162,10 @@ async def create_item(data, message):
     try:
         key = str(uuid.uuid4())
         logger.debug(f"Item: {key} created")
-        value = msgpack.encode(StockValue(stock=0, price=int(price)))
+        item = StockValue(stock=0, price=int(price))
+        value = msgpack.encode(item)
         await db_master.set(key, value)
-        return {'item_id': key}, 200
+        return {'item_id': key, 'stock': item.stock, 'price': item.price}, 201
     
     except redis.exceptions.RedisError as re:
         return {'error': f"Redis Error: {re}"}, 500
@@ -290,7 +289,9 @@ async def remove_stock(data, message):
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
             error_response["callback_action"] = callback_action or "process_stock_completed"
-        return error_response, 400
+        status_code = 400
+        logging.warning(f"[remove_stock:RETURN] Returning error1 tuple: ({error_response}, {status_code})") 
+        return error_response, status_code
 
     try:
         amount_int = int(amount)
@@ -300,14 +301,18 @@ async def remove_stock(data, message):
                 error_response["saga_id"] = saga_id
                 error_response["order_id"] = order_id
                 error_response["callback_action"] = callback_action or "process_stock_completed"
-            return error_response, 400
+            status_code = 400
+            logging.warning(f"[remove_stock:RETURN] Returning error2 tuple: ({error_response}, {status_code})")
+            return error_response, status_code
     except (ValueError, TypeError):
         error_response = {"error": "Invalid amount specified"}
         if saga_id:
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
             error_response["callback_action"] = callback_action or "process_stock_completed"
-        return error_response, 400
+        status_code = 400
+        logging.warning(f"[remove_stock:RETURN] Returning error1 tuple: ({error_response}, {status_code})")
+        return error_response, status_code
 
     def updater(item: StockValue) -> StockValue:
         if item.stock < amount_int:
@@ -340,7 +345,9 @@ async def remove_stock(data, message):
                 except Exception as e:
                     logger.error(f"[Stock] Failed to send error callback: {e}", exc_info=True)
 
-            return error_response, 400 if "not found" in error_msg.lower() else 500
+            status_code = 400 if "not found" in error_msg.lower() else 500
+            logging.warning(f"[remove_stock:RETURN] Returning error4 tuple: ({error_response}, {status_code})")
+            return error_response, status_code
 
         if updated_item:
             success_response = {
@@ -377,14 +384,18 @@ async def remove_stock(data, message):
                 except Exception as e:
                     logger.error(f"[Stock] Failed to send callback after all attempts: {e}", exc_info=True)
 
-            return success_response, 200
+            status_code = 200
+            logging.warning(f"[remove_stock:RETURN] Returning success1 tuple: ({success_response}, {status_code})")
+            return success_response, status_code
         else:
             error_response = {"error": "Failed to update item for unknown reason"}
             if saga_id:
                 error_response["saga_id"] = saga_id
                 error_response["order_id"] = order_id
                 error_response["callback_action"] = "process_stock_completed"
-            return error_response, 500
+            status_code = 500
+            logging.warning(f"[remove_stock:RETURN] Returning error4 tuple: ({error_response}, {status_code})")
+            return error_response, status_code
 
     except ValueError as e:
 
@@ -410,7 +421,9 @@ async def remove_stock(data, message):
                 except Exception as e:
                     logger.error(f"[Stock] Failed to send insufficient stock callback: {e}")
 
-        return error_response, 400
+        status_code = 400
+        logging.warning(f"[remove_stock:RETURN] Returning error2 tuple: ({error_response}, {status_code})")
+        return error_response, status_code
 
     except Exception as e:
         logger.exception(f"[Stock] Unexpected error in remove_stock: {e}")
@@ -419,7 +432,9 @@ async def remove_stock(data, message):
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
             error_response["callback_action"] = "process_stock_completed"
-        return error_response, 500
+        status_code = 500
+        logging.warning(f"[remove_stock:RETURN] Returning error3 tuple: ({error_response}, {status_code})")
+        return error_response, status_code 
 async def main():
     try:
         await worker.start()
