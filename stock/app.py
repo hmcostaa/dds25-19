@@ -255,6 +255,7 @@ async def add_stock(data, message):
         logger.exception("internal error")
         return ({"paid": False, "internal error": error_msg}, 400)
 
+
 @worker.register
 @idempotent('remove_stock', idempotency_redis_client, SERVICE_NAME)
 async def remove_stock(data, message):
@@ -262,91 +263,163 @@ async def remove_stock(data, message):
     amount = data.get("amount")
     saga_id = data.get("saga_id")
     order_id = data.get("order_id")
+    callback_action = data.get("callback_action")
+
+    # Debug log all incoming parameters
+    debug_info = {
+        "item_id": item_id,
+        "amount": amount,
+        "saga_id": saga_id,
+        "order_id": order_id,
+        "callback_action": callback_action,
+    }
+
+    if message:
+        if hasattr(message, 'reply_to'):
+            debug_info["message_reply_to"] = message.reply_to
+        if hasattr(message, 'headers'):
+            debug_info["message_headers"] = message.headers
+        if hasattr(message, 'correlation_id'):
+            debug_info["message_correlation_id"] = message.correlation_id
+
+    logger.info(f"[Stock Debug Info] remove_stock called with: {debug_info}")
+
     if not all([item_id, amount is not None]):
-        logger.error("Missing item_id or amount in remove_stock request.")
-        error_response = {"error": "Missing required fields"}
+        error_response = {"error": "Missing required fields (item_id, amount)"}
         if saga_id:
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
-        return error_response,400
-        
+            error_response["callback_action"] = callback_action or "process_stock_completed"
+        return error_response, 400
+
     try:
-        if int(amount) <= 0:
+        amount_int = int(amount)
+        if amount_int <= 0:
             error_response = {"error": "Transaction amount must be positive"}
             if saga_id:
                 error_response["saga_id"] = saga_id
                 error_response["order_id"] = order_id
+                error_response["callback_action"] = callback_action or "process_stock_completed"
             return error_response, 400
-        
     except (ValueError, TypeError):
-        error_response= {"error": "Invalid amount specified"}
+        error_response = {"error": "Invalid amount specified"}
         if saga_id:
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
+            error_response["callback_action"] = callback_action or "process_stock_completed"
         return error_response, 400
-    
+
     def updater(item: StockValue) -> StockValue:
-        if item.stock < int(amount):
-            raise ValueError(f"Error, Insufficient stock for item {item_id} (available: {item.stock}, requested: {int(amount)})")
-        item.stock -= int(amount)
+        if item.stock < amount_int:
+            raise ValueError(
+                f"Insufficient stock for item {item_id} (available: {item.stock}, requested: {amount_int})")
+        item.stock -= amount_int
         return item
-    
+
     try:
         updated_item, error_msg = await atomic_update_item(item_id, updater)
         if error_msg:
-            logger.error(f"Failed to cancel stock (refund) for user {item_id}: {error_msg}")
-            status_code = 404 if "not found" in error_msg.lower() else 500
-            error_response= {"error": f"Failed to cancel stock: {error_msg}"}
+            error_response = {"error": f"Failed to update stock: {error_msg}"}
             if saga_id:
                 error_response["saga_id"] = saga_id
                 error_response["order_id"] = order_id
-            return error_response, status_code
+                error_response["callback_action"] = callback_action or "process_stock_completed"
+            if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
+                try:
+                    logger.info(f"[Stock] Sending error callback to {message.reply_to} for saga {saga_id}")
+                    error_response["callback_action"] = "process_stock_completed"
+                    await worker.send_message(
+                        payload=error_response,
+                        queue=message.reply_to,
+                        correlation_id=saga_id,
+                        action="process_stock_completed",
+                        callback_action="process_stock_completed",
+                        reply_to=None
+                    )
+                    logger.info(f"[Stock] Error callback sent successfully to {message.reply_to}")
+                except Exception as e:
+                    logger.error(f"[Stock] Failed to send error callback: {e}", exc_info=True)
+
+            return error_response, 400 if "not found" in error_msg.lower() else 500
 
         if updated_item:
-            success_response= {"removed": True,
+            success_response = {
+                "removed": True,
                 "stock": updated_item.stock,
                 "saga_id": saga_id,
-                "order_id": order_id}
-            if saga_id:
-                success_response["saga_id"] = saga_id
-                success_response["order_id"] = order_id
-            if message and hasattr(message, 'reply_to') and message.reply_to:
+                "order_id": order_id,
+                "callback_action": "process_stock_completed"  # Always include this
+            }
+            if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
+                logging.info(f"[Stock] Sending success callback to {message.reply_to} for saga {saga_id}")
                 try:
-                    callback_action = message.headers.get('callback_action')
-                    if callback_action:
-                        logger.info(f"Sending callback to {message.reply_to} with action {callback_action}")
-                        await worker.send_message(
-                            payload=success_response,
-                            queue=message.reply_to,
-                            correlation_id=saga_id,
-                            action=callback_action
-                        )
-                except Exception as callback_err:
-                    logger.error(f"Error sending callback: {callback_err}")
+                    reply_to = message.reply_to
+                    for attempt in range(3):
+                        logger.info(f"[Stock] Attempt #{attempt+1}")
+                        logger.info(f"[Stock] Sending success callback to {reply_to} for saga {saga_id}")
+                        logger.info(f"[Stock] Success response: {success_response}")
+                        logger.info(f"[Stock] Correlation ID: {saga_id}")
+                        try:
+                            await worker.send_message(
+                                payload=success_response,
+                                queue=reply_to,
+                                correlation_id=saga_id,
+                                action="process_stock_completed",
+                                callback_action="process_stock_completed",
+                                reply_to=None
+                            )
+                            logger.info(f"[Stock] Success callback sent to {reply_to} (attempt {attempt + 1})")
+                        except Exception as e:
+                            logger.error(f"[Stock] Error sending callback (attempt {attempt + 1}): {e}")
+                            await asyncio.sleep(0.1)
+                            if attempt == 2:
+                                raise
+                except Exception as e:
+                    logger.error(f"[Stock] Failed to send callback after all attempts: {e}", exc_info=True)
+
             return success_response, 200
         else:
-            logger.error(f"Cancel stock failed for user {item_id}, unknown reason .")
-            error_response = {"error": "Failed stock cancellation, unknown reason"}
+            error_response = {"error": "Failed to update item for unknown reason"}
             if saga_id:
                 error_response["saga_id"] = saga_id
                 error_response["order_id"] = order_id
+                error_response["callback_action"] = "process_stock_completed"
             return error_response, 500
+
     except ValueError as e:
-        error_message = f"Error:Insufficient stock for item {item_id}: {e}"
-        logger.warning(f"Error:Insufficient stock for user {item_id}: {e}")
+
+        error_message = str(e)
         error_response = {"error": error_message}
         if saga_id:
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
+            error_response["callback_action"] = "process_stock_completed"
+
+
+            if message and hasattr(message, 'reply_to') and message.reply_to:
+                try:
+                    logger.info(f"[Stock] Sending insufficient stock callback to {message.reply_to}")
+                    await worker.send_message(
+                        payload=error_response,
+                        queue=message.reply_to,
+                        correlation_id=saga_id,
+                        action="process_stock_completed",
+                        callback_action="process_stock_completed",
+                        reply_to=None
+                    )
+                except Exception as e:
+                    logger.error(f"[Stock] Failed to send insufficient stock callback: {e}")
+
         return error_response, 400
+
     except Exception as e:
-        logger.exception("Error canceling stock for user %s: %s", item_id, e)
-        error_response = {"error": f"Error canceling stock for user {item_id}: {e}"}
+        logger.exception(f"[Stock] Unexpected error in remove_stock: {e}")
+        error_response = {"error": f"Unexpected error: {str(e)}"}
         if saga_id:
             error_response["saga_id"] = saga_id
             error_response["order_id"] = order_id
+            error_response["callback_action"] = "process_stock_completed"
         return error_response, 500
-
 async def main():
     try:
         await worker.start()

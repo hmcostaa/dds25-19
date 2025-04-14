@@ -307,10 +307,17 @@ async def pay(data, message) -> IdempotencyResultTuple:
 @idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME)
 async def remove_credit(data, message)-> IdempotencyResultTuple:
     user_id = data.get("user_id")
-    amount = data.get("amount")
+    raw_amount = data.get("amount")
+    saga_id = data.get("saga_id")
+    order_id = data.get("order_id")
+    callback_action = data.get("callback_action")
+    try:
+        amount = int(raw_amount)
+    except (ValueError, TypeError):
+        return {"error": f"Invalid amount '{raw_amount}'"}, 400
 
     if not user_id or amount <= 0:
-        return {"error": "Invalid request"}, 400
+        return {"error": "Invalid request (missing user_id or amount <= 0)"}, 400
 
     def updater(user: UserValue) -> UserValue:
         if user.credit < amount:
@@ -321,37 +328,105 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
     updated_user, error_msg = await atomic_update_user(user_id, updater)
 
     if error_msg:
-        return {"error": error_msg}, 400
-    return {"msg": f"Removed {amount} from user {user_id}"}, 200
+        if saga_id and order_id:
+            try:
 
+                await worker.send_message(
+                    payload={
+                        "saga_id": saga_id,
+                        "order_id": order_id,
+                        "error": error_msg,
+                        "success": False,
+                        "callback_action": callback_action or "process_payment_completed"  # Use provided or default
+                    },
+                    queue="orchestrator_queue",
+                    correlation_id=saga_id,
+                    action="process_payment_completed",
+                    callback_action="process_payment_completed",
+                    reply_to=None
+                )
+                logging.info(f"[Payment] Sent payment failure notification for saga {saga_id}")
+            except Exception as e:
+                logging.error(f"[Payment] Failed to send failure notification: {e}")
+        return {"error": error_msg}, 400
+
+
+    if saga_id and order_id:
+        try:
+
+            response_payload = {
+                "saga_id": saga_id,
+                "order_id": order_id,
+                "success": True,
+                "remaining_credit": updated_user.credit,
+                "callback_action": callback_action or "process_payment_completed"
+
+            }
+
+            logging.info(f"[Payment] Sending payment completion notification with payload: {response_payload}")
+
+            await worker.send_message(
+                payload=response_payload,
+                queue="orchestrator_queue",
+                correlation_id=saga_id,
+                action="process_payment_completed",
+                callback_action="process_payment_completed"
+            )
+            logging.info(f"[Payment] Sent payment completion notification for saga {saga_id}")
+        except Exception as e:
+            logging.error(f"[Payment] Failed to send success notification: {e}")
+
+    return {"msg": f"Removed {amount} from user {user_id}"}, 200
 @worker.register
 @idempotent('compensate', idempotency_redis_client, SERVICE_NAME)
 async def compensate(data, message):
     try:
         user_id = data.get("user_id")
         amount = data.get("amount")
+        saga_id = data.get("saga_id")
+        order_id = data.get("order_id")
 
         if not all([user_id, amount is not None]):
             logging.error("Missing user_id or amount in cancel_payment request.")
             return {"error": "Missing required fields"}, 400
-        
+
         if int(amount) <= 0:
             return {"error": "Transaction amount must be positive"}, 400
-        
+
     except (ValueError, TypeError):
         return {"error": "Invalid amount specified"}, 400
-    
+
     def updater(user: UserValue) -> UserValue:
         user.credit += amount
         return user
-    
+
     try:
         updated_user, error_msg = await atomic_update_user(user_id, updater)
         if error_msg:
             logging.error(f"Failed to cancel payment (refund) for user {user_id}: {error_msg}")
             status_code = 404 if "not found" in error_msg.lower() else 500
             return {"error": f"Failed to cancel payment: {error_msg}"}, status_code
+
         if updated_user:
+            if saga_id and order_id:
+                try:
+                    await worker.send_message(
+                        payload={
+                            "saga_id": saga_id,
+                            "order_id": order_id,
+                            "success": True,
+                            "message": f"Successfully refunded {amount} to user {user_id}",
+                            "callback_action": "process_compensation_completed"
+                        },
+                        queue="orchestrator_queue",
+                        correlation_id=saga_id,
+                        action="process_compensation_completed",
+                        callback_action="process_compensation_completed"
+                    )
+                    logging.info(f"[Payment] Sent compensation completion notification for saga {saga_id}")
+                except Exception as e:
+                    logging.error(f"[Payment] Failed to send compensation notification: {e}")
+
             return {"refunded": True, "credit": updated_user.credit}, 200
         else:
             logging.error(f"Cancel payment failed for user {user_id}, unknown reason .")
@@ -359,7 +434,6 @@ async def compensate(data, message):
     except Exception as e:
         logging.exception("Error canceling payment for user %s: %s", user_id, e)
         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
-
 async def main():
     try:
         await worker.start()
