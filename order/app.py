@@ -390,6 +390,7 @@ async def get_order_from_db(order_id: str) -> Tuple[Union[OrderValue, Dict], int
         logging.error(f"Error while getting order: {order_id} from the database:{str(e)}")
         return {"error": DB_ERROR_STR}, 400
 
+@worker.register
 @app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
 async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
