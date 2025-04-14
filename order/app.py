@@ -917,100 +917,51 @@ async def process_payment_completed(data, message):
             logging.info(f"[Order Orchestrator] Published payment completion notification for saga {saga_id}")
         except Exception as e:
             logging.error(f"[Order Orchestrator] Failed to publish payment completion notification: {str(e)}")
+
         saga_data = await get_saga_state(saga_id)
         if not saga_data:
             logging.error(f"[Order Orchestrator] Saga {saga_id} not found")
             if message:
                 await message.ack()
             return {"error": f"Saga {saga_id} not found"}, 404
-        item_details = saga_data.get("details", {})
-        items_to_be_removed = item_details.get("items", item_details.get("reserved_items", []))
-        lock_value = item_details.get("lock_value")
 
+        lock_value = None
+        details = saga_data.get("details", {})
+        if details:
+            lock_value = details.get("lock_value")
         if not lock_value:
-            logging.warning(
-                f"[Order Orchestrator] No lock value found for order {order_id}, attempting to proceed anyway")
+            logging.warning(f"[Order Orchestrator] No lock value found for order {order_id}, proceeding without lock release.")
 
-        if not items_to_be_removed:
-            logging.error(f"[Order Orchestrator] No items to be removed for order {order_id}")
+        logging.info("[Order Orchestrator] Skipping duplicate stock removal as it was already performed during reservation.")
+
+        current_order, status = await get_order_from_db(order_id)
+        if status != 200:
+            logging.error(f"[Order Orchestrator] Failed to get order {order_id} for payment completion")
             if message:
                 await message.ack()
-            return {"error": f"No items to be removed for order {order_id}"}, 400
-        try:
-            current_order, status = await get_order_from_db(order_id)
-            if status != 200:
-                logging.error(f"[Order Orchestrator] Failed to get order {order_id} for payment completion")
-                if message:
-                    await message.ack()
-                return {"error": f"Failed to get order {order_id}"}, 404
+            return {"error": f"Failed to get order {order_id}"}, 404
 
-            def update_order_paid(order):
-                order.paid = True
-                return order
+        def update_order_paid(order):
+            order.paid = True
+            return order
 
-            updated_order, error_msg = await atomic_update_order(order_id, update_func=update_order_paid)
-            if error_msg:
-                logging.error(f"[Order Orchestrator] Failed to mark order {order_id} as paid: {error_msg}")
-                if message:
-                    await message.ack()
-                return {"error": f"Failed to mark order as paid: {error_msg}"}, 500
-            
+        updated_order, error_msg = await atomic_update_order(order_id, update_func=update_order_paid)
+        if error_msg:
+            logging.error(f"[Order Orchestrator] Failed to mark order {order_id} as paid: {error_msg}")
+            if message:
+                await message.ack()
+            return {"error": f"Failed to mark order as paid: {error_msg}"}, 500
 
-            if lock_value:
-                order_released = await release_write_lock(order_id, lock_value)
+        logging.info(f"[Order Orchestrator] Successfully marked order {order_id} as paid")
+
+        if lock_value:
+            order_released = await release_write_lock(order_id, lock_value)
             if order_released:
                 await update_saga_and_enqueue(
                     saga_id,
                     "ORDER_LOCK_RELEASED",
                     routing_key=None,
                     payload=None
-                )
-            else:
-                logging.error(f"Failed to release lock for order {order_id} with lock value {lock_value}")
-                force_released = await force_release_locks(order_id)
-                if force_released:
-                    await update_saga_and_enqueue(
-                        saga_id,
-                        "ORDER_LOCK_RELEASE_FAILED",
-                        details={"error": f"Failed to release lock for order {order_id} with value {lock_value}"},
-                        routing_key=None,
-                        payload=None
-                    )
-                else:
-                    logging.error(f"Both normal and force release failed for order {order_id}")
-
-            await update_saga_and_enqueue(
-                saga_id,
-                "ORDER_FINALIZED",
-                routing_key=None,
-                payload=None
-            )
-            await update_saga_and_enqueue(
-                saga_id,
-                "SAGA_COMPLETED",
-                details={"completed_at": time.time()},
-                routing_key=None,
-                payload=None
-            )
-            try:
-                completion_channel = f"saga_completion:{saga_id}"
-                await db_master_saga.publish(completion_channel, json.dumps({"success": True}))
-                logging.info(f"[Order Orchestrator] Published final completion notification for saga {saga_id}")
-            except Exception as e:
-                logging.error(f"[Order Orchestrator] Failed to publish final completion notification: {str(e)}")
-
-            if message and hasattr(message, 'ack'):
-                await message.ack()
-            return {"status": "success", "step": "payment completed"}, 200
-        except Exception as e:
-            logging.error(f"[Order Orchestrator] Error updating order payment status: {str(e)}")
-        order_released = await release_write_lock(order_id, lock_value)
-        if order_released:
-            await update_saga_and_enqueue(
-                saga_id,
-                "ORDER_LOCK_RELEASED",
-                routing_key=None,
-                payload=None,
             )
         else:
             logging.error(f"Failed to release lock for order {order_id} with lock value {lock_value}")
@@ -1021,30 +972,23 @@ async def process_payment_completed(data, message):
                     "ORDER_LOCK_RELEASE_FAILED",
                     details={"error": f"Failed to release lock for order {order_id} with value {lock_value}"},
                     routing_key=None,
-                    payload=None,
+                    payload=None
                 )
             else:
                 logging.error(f"Both normal and force release failed for order {order_id}")
-
-            completion_channel = f"saga_completion:{saga_id}"
-            try:
-                await db_master_saga.publish(completion_channel, json.dumps({"success": True}))
-                logging.info(f"[Order Orchestrator] Published completion notification for saga {saga_id}")
-            except Exception as e:
-                logging.error(f"[Order Orchestrator] Failed to publish completion: {str(e)}")
 
         await update_saga_and_enqueue(
             saga_id,
             "ORDER_FINALIZED",
             routing_key=None,
-            payload=None,
+            payload=None
         )
         await update_saga_and_enqueue(
             saga_id,
             "SAGA_COMPLETED",
             details={"completed_at": time.time()},
             routing_key=None,
-            payload=None,
+            payload=None
         )
         try:
             completion_channel = f"saga_completion:{saga_id}"
@@ -1052,51 +996,17 @@ async def process_payment_completed(data, message):
             logging.info(f"[Order Orchestrator] Published final completion notification for saga {saga_id}")
         except Exception as e:
             logging.error(f"[Order Orchestrator] Failed to publish final completion notification: {str(e)}")
+
         if message and hasattr(message, 'ack'):
             await message.ack()
-
         return {"status": "success", "step": "payment completed"}, 200
 
     except Exception as e:
         logging.error(f"[Order Orchestrator] Error in process_payment_completed: {str(e)}", exc_info=True)
         if message and hasattr(message, 'ack'):
             await message.ack()
-        if 'saga_id' in locals():
-            try:
-                order_id = locals().get('order_id')
-                if not order_id:
-                    saga_data = await get_saga_state(saga_id)
-                    if saga_data:
-                        order_id = saga_data.get("details", {}).get("order_id")
-
-                if order_id:
-                    await update_saga_and_enqueue(
-                        saga_id=saga_id,
-                        status="ORDER_FINALIZATION_FAILED",
-                        details={"error": str(e)},
-                        routing_key="payment.reverse",
-                        payload={"saga_id": saga_id, "order_id": order_id}
-                    )
-                    saga_data = await get_saga_state(saga_id)
-                    if saga_data:
-                        steps_completed = [steps["status"] for steps in saga_data.get("steps", [])]
-                        if "STOCK_RESERVATION_COMPLETED" in steps_completed:
-                            await enqueue_outbox_message("stock.compensate", {
-                                "saga_id": saga_id,
-                                "order_id": order_id
-                            })
-                        await enqueue_outbox_message("order.checkout_failed", {
-                            "saga_id": saga_id,
-                            "order_id": order_id,
-                            "status": "failed",
-                            "error": f"Failed during order finalization: {str(e)}"
-                        })
-                    completion_channel = f"saga_completion:{saga_id}"
-                    await db_master_saga.publish(completion_channel, json.dumps({"success": False, "error": str(e)}))
-            except Exception as inner_e:
-                logging.error(f"[Order Orchestrator] Error during failure handling: {str(inner_e)}", exc_info=True)
-
         return {"error": f"Failed to process payment completion: {str(e)}"}, 500
+
 
 @idempotent('process_failure_events', idempotency_redis_client, SERVICE_NAME)
 async def process_failure_events(data, message):
@@ -1596,7 +1506,7 @@ async def recover_in_progress_sagas():
                     
     except Exception as e:
         print(f"!!! ERROR INSIDE recover_in_progress_sagas: {e}", flush=True)
-        logging.error(f"Error recovering sagas: {str(e)}", exec_info=True)
+        logging.error(f"Error recovering sagas: {str(e)}", exc_info=True)
 
 
 

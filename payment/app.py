@@ -12,8 +12,9 @@ from flask import Flask, jsonify, abort, Response
 from typing import Optional, Tuple, Any, Union, Tuple, Dict
 from redis.exceptions import WatchError, RedisError
 import random
-import logging
 import time
+import logging
+
 from global_idempotency.idempotency_decorator import idempotent
 
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
@@ -239,8 +240,6 @@ async def add_funds(data, message) -> IdempotencyResultTuple:
         return user
     
     
-    # decorator now handles try except
-    # atomic_update_user(data["user_id"], updater)
     updated_user, error_msg = await atomic_update_user(user_id, updater)
 
     if error_msg:
@@ -306,27 +305,60 @@ async def pay(data, message) -> IdempotencyResultTuple:
 @worker.register
 @idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME)
 async def remove_credit(data, message)-> IdempotencyResultTuple:
+    """
+    Remove credit from a user's account as part of a payment process.
+    Returns a tuple of (data_dict, status_code) for idempotency handling.
+    """
+    logging.info(f"[PAYMENT] Starting remove_credit operation")
+    
     user_id = data.get("user_id")
     raw_amount = data.get("amount")
     saga_id = data.get("saga_id")
     order_id = data.get("order_id")
     callback_action = data.get("callback_action")
+    
+    correlation_id = getattr(message, "correlation_id", "unknown")
+    logging.info(f"[PAYMENT] Processing remove_credit: user_id={user_id}, amount={raw_amount}, saga_id={saga_id}, order_id={order_id}")
+    logging.debug(f"[PAYMENT] Correlation ID: {correlation_id}, Callback action: {callback_action}")
+    logging.debug(f"[PAYMENT] Full request data: {data}")
+    
     try:
+        logging.debug(f"[PAYMENT] Converting amount '{raw_amount}' to integer")
         amount = int(raw_amount)
-    except (ValueError, TypeError):
-        return {"error": f"Invalid amount '{raw_amount}'"}, 400
+        logging.debug(f"[PAYMENT] Amount conversion successful: {amount}")
+    except (ValueError, TypeError) as e:
+        error_msg = f"Invalid amount '{raw_amount}'"
+        logging.error(f"[PAYMENT] {error_msg}: {str(e)}")
+        logging.debug(f"[PAYMENT] Amount type: {type(raw_amount)}")
+        return {"error": error_msg}, 400
 
-    if not user_id or amount <= 0:
+    if not user_id:
+        logging.error("[PAYMENT] Missing required field: user_id")
         return {"error": "Invalid request (missing user_id or amount <= 0)"}, 400
+        
+    if amount <= 0:
+        logging.error(f"[PAYMENT] Invalid amount: {amount} <= 0")
+        return {"error": "Invalid request (missing user_id or amount <= 0)"}, 400
+    
+    logging.info(f"[PAYMENT] Validation passed for user_id={user_id}, amount={amount}")
 
     def updater(user: UserValue) -> UserValue:
+        logging.debug(f"[PAYMENT] User before update: user_id={user_id}, credit={user.credit}")
         if user.credit < amount:
+            logging.warning(f"[PAYMENT] Insufficient funds: user_id={user_id}, credit={user.credit}, amount={amount}")
             raise ValueError("Insufficient funds")
+        
+        old_credit = user.credit
         user.credit -= amount
+        logging.info(f"[PAYMENT] Credit updated: user_id={user_id}, old_credit={old_credit}, new_credit={user.credit}, amount_deducted={amount}")
         return user
 
+    logging.debug(f"[PAYMENT] Calling atomic_update_user for user_id={user_id}")
+    start_time = time.time()
     updated_user, error_msg = await atomic_update_user(user_id, updater)
-
+    execution_time = time.time() - start_time
+    logging.debug(f"[PAYMENT] atomic_update_user completed in {execution_time:.3f}s")
+    
     if error_msg:
         logging.error(f"[PAYMENT] Failed to update user: {error_msg}")
         
@@ -336,7 +368,7 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
                 reply_to_queue = getattr(message, "reply_to", "orchestrator_queue")
                 if not reply_to_queue:
                     reply_to_queue = "orchestrator_queue"
-                    logging.warning(f"[Payment Saga] Reply to queue not provided, using default: {reply_to_queue}")
+                    logging.warning(f"[PAYMENT] Reply to queue not provided, using default: {reply_to_queue}")
                 else:
                     logging.info(f"[PAYMENT] Reply to queue provided: {reply_to_queue}")
 
@@ -359,17 +391,21 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
                     callback_action="process_payment_completed",
                     reply_to=reply_to_queue
                 )
-                logging.info(f"[Payment] Sent payment failure notification for saga {saga_id}")
+                logging.info(f"[PAYMENT] Sent payment failure notification for saga {saga_id}")
             except Exception as e:
-                logging.error(f"[Payment] Failed to send failure notification: {e}")
+                logging.error(f"[PAYMENT] Failed to send failure notification: {str(e)}", exc_info=True)
+                
+        logging.debug(f"[PAYMENT] Returning error response with status code 400")
         return ({"error": error_msg}, 400)
 
-
     if updated_user:
+        logging.info(f"[PAYMENT] Successfully updated user_id={user_id}, new_credit={updated_user.credit}")
+        
         if saga_id and order_id and getattr(message, "reply_to", None):
             try:
                 reply_to_queue = message.reply_to
-                logging.debug(f"[PAYMENT] Constructing direct success payload for saga_id={saga_id}")
+                logging.info(f"[PAYMENT] Attempting direct success reply to {reply_to_queue} for saga {saga_id}")
+                
                 direct_success_payload = {
                     "saga_id": saga_id,
                     "order_id": order_id,
@@ -388,10 +424,11 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
                     callback_action="process_payment_completed",
                     reply_to=None
                 )
-                logging.info(f"[Payment] Sent direct payment completion notification for saga {saga_id}")
+                logging.info(f"[PAYMENT] Sent direct payment completion notification for saga {saga_id}")
             except Exception as e:
-                logging.error(f"[Payment] Failed to send direct success notification: {e}")
+                logging.error(f"[PAYMENT] Failed to send direct success notification: {str(e)}", exc_info=True)
 
+        logging.debug(f"[PAYMENT] Constructing success response")
         success_data = {
             "message": f"Removed {amount} from user {user_id}",
             "credit": updated_user.credit,
@@ -399,11 +436,19 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
             "order_id": order_id,
             "callback_action": callback_action or "process_payment_completed"
         }
+        logging.info(f"[PAYMENT] Operation completed successfully for user_id={user_id}, saga_id={saga_id}")
         return (success_data, 200) 
     else:
+        logging.error(f"[PAYMENT] Failed to update user {user_id}, unknown reason")
         error_data = {"error": "Failed to update user, unknown reason"}
-        if saga_id: error_data["saga_id"] = saga_id
-        if order_id: error_data["order_id"] = order_id
+        if saga_id: 
+            error_data["saga_id"] = saga_id
+            logging.debug(f"[PAYMENT] Added saga_id={saga_id} to error response")
+        if order_id: 
+            error_data["order_id"] = order_id
+            logging.debug(f"[PAYMENT] Added order_id={order_id} to error response")
+        
+        logging.debug(f"[PAYMENT] Returning error response with status code 500: {error_data}")
         return (error_data, 500)
 
 @worker.register
