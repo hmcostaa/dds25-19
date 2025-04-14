@@ -3,3 +3,4 @@ WORKDIR /usr/src/app/gateway
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY *.py ./
+CMD ["python", "app.py"]
