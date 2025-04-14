@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+
 from redis.asyncio.sentinel import Sentinel
 import redis  # Standard Redis for exceptions
 import redis.asyncio as aioredis  # Async Redis as a different name
@@ -39,14 +41,51 @@ class RedisPoolManager:
     async def get_master(self, service_name, decode_responses=False, db=0):
         if self.sentinel is None:
             raise RuntimeError("Sentinel not initialized")
+
         pool_key = f"master:{service_name}:{decode_responses}:{db}"
-        if pool_key not in self._pools:
-            self._pools[pool_key] = self.sentinel.master_for(
+        try:
+            refresh_needed = pool_key not in self.__class__._pools or time.time() - self.__class__._last_refresh > 30
+
+            if refresh_needed:
+                master_pool = self.sentinel.master_for(
+                    service_name,
+                    decode_responses=decode_responses,
+                    db=db
+                )
+
+                try:
+                    # Test the connection - this will fail if the master is down
+                    await master_pool.ping()
+                    self.__class__._pools[pool_key] = master_pool
+                    logging.info(f"Successfully connected to master for {service_name}")
+                except Exception as e:
+                    logging.warning(f"Master ping failed for {service_name}: {e}")
+                    # Force sentinel to rediscover masters - THIS IS THE KEY PART FOR FAILOVER
+                    await self.refresh_sentinel_connections()
+                    # Try again with the new master topology
+                    master_pool = self.sentinel.master_for(
+                        service_name,
+                        decode_responses=decode_responses,
+                        db=db
+                    )
+                    await master_pool.ping()  # Verify the new connection
+                    self.__class__._pools[pool_key] = master_pool
+                    logging.info(f"Reconnected to new master for {service_name} after failover")
+
+            # Return the current master - should be the promoted replica if failover occurred
+            return self.__class__._pools[pool_key]
+        except Exception as e:
+            logging.error(f"Error getting master for {service_name}: {e}")
+            # Try to refresh all sentinel connections as a last resort
+            await self.refresh_sentinel_connections()
+            # Return a fresh connection even if it's not in our pool
+            master_pool = self.sentinel.master_for(
                 service_name,
                 decode_responses=decode_responses,
                 db=db
             )
-        return self.__class__._pools[pool_key]
+            self.__class__._pools[pool_key] = master_pool
+            return master_pool
 
     async def get_slave(self, service_name, decode_responses=False, db=0):
         if self.sentinel is None:
@@ -59,6 +98,60 @@ class RedisPoolManager:
                 db=db
             )
         return self.__class__._pools[pool_key]
+
+    async def refresh_sentinel_connections(self):
+        current_time = time.time()
+        if current_time - self.__class__._last_refresh < 5:
+            return
+
+        self.__class__._last_refresh = current_time
+
+        try:
+            for service_name in ['order', 'payment', 'stock', 'saga']:
+                try:
+                    # This asks Sentinel for the current master - critical for failover
+                    new_master_info = await self.sentinel.discover_master(service_name)
+                    logging.info(f"Current master for {service_name}: {new_master_info}")
+
+                    # Check if master has changed - indicates failover
+                    old_master = self._masters.get(service_name)
+                    if old_master != new_master_info:
+                        logging.warning(
+                            f"Master change detected for {service_name}! Old: {old_master}, New: {new_master_info}")
+                        # Update our knowledge of the master
+                        self._masters[service_name] = new_master_info
+
+                        # Close and recreate all connections for this service
+                        for prefix in ['master', 'slave']:
+                            for decode_responses in [True, False]:
+                                for db in range(3):  # Common db numbers
+                                    pool_key = f"{prefix}:{service_name}:{decode_responses}:{db}"
+                                    if pool_key in self.__class__._pools:
+                                        # Close old connection
+                                        try:
+                                            await self.__class__._pools[pool_key].close()
+                                        except Exception as e:
+                                            logging.error(f"Error closing old connection: {e}")
+
+                                        # Create new connection pointing to the new master/replica
+                                        if prefix == 'master':
+                                            self.__class__._pools[pool_key] = self.sentinel.master_for(
+                                                service_name,
+                                                decode_responses=decode_responses,
+                                                db=db
+                                            )
+                                        else:
+                                            self.__class__._pools[pool_key] = self.sentinel.slave_for(
+                                                service_name,
+                                                decode_responses=decode_responses,
+                                                db=db
+                                            )
+                except Exception as e:
+                    logging.error(f"Error discovering master for {service_name}: {e}")
+
+            logging.info("Sentinel connections refreshed successfully")
+        except Exception as e:
+            logging.error(f"Error refreshing sentinel connections: {e}")
 
     async def refresh_master_connection(self, service_name):
         """Force a refresh of the master connection for the given service"""

@@ -131,7 +131,6 @@ def register_original(name=None):
     return decorator
 
 
-
 def redis_operation_with_retry(max_retries=3, backoff_ms=200):
     def decorator(func):
         @functools.wraps(func)
@@ -140,10 +139,31 @@ def redis_operation_with_retry(max_retries=3, backoff_ms=200):
             for attempt in range(max_retries):
                 try:
                     return await func(*args, **kwargs)
-                except (redis.ConnectionError, redis.TimeoutError) as e:
+                except (redis.ConnectionError, redis.TimeoutError, ConnectionRefusedError) as e:
                     last_exception = e
                     logging.warning(f"Redis connection error on attempt {attempt + 1}/{max_retries}: {str(e)}")
-                    await get_redis_connections()
+
+                    # The key part: force connection refresh on error - this enables failover handling
+                    try:
+                        sentinel_hosts = [
+                            (os.environ['REDIS_SENTINEL_1'], 26379),
+                            (os.environ['REDIS_SENTINEL_2'], 26379),
+                            (os.environ['REDIS_SENTINEL_3'], 26379)
+                        ]
+                        pool_manager = await RedisPoolManager.get_instance(
+                            sentinel_hosts=sentinel_hosts,
+                            password=os.environ['REDIS_PASSWORD']
+                        )
+                        # Force reset all connections - this will contact Sentinel for current masters
+                        await pool_manager.reset_connections()
+                        await get_redis_connections()
+
+                        # Log failover info
+                        logging.info(
+                            f"Redis connections refreshed after connection error. Attempt {attempt + 1}/{max_retries}")
+                    except Exception as refresh_error:
+                        logging.error(f"Failed to refresh Redis connections: {refresh_error}")
+
                     wait_time = (backoff_ms * (2 ** attempt)) / 1000
                     await asyncio.sleep(wait_time)
             raise last_exception
@@ -379,7 +399,7 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
                logging.info(
                    f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox")
                return True
-       except redis.WatchError:
+       except aioredis.WatchError:
            logging.warning(f"[SAGA UPDATE] Retry {attempt+1}/{max_attempts}. Saga {saga_id} failed to update. WatchError on {saga_id}")
        except redis.RedisError as e:
            logging.error(f"[SAGA UPDATE] Redis error on attempt {attempt+1}: {e}")
@@ -1806,27 +1826,60 @@ async def health_check_server():
     await site.start()
     logging.info("[Order Orchestrator] Health check server started on :8000")
 
+
 async def refresh_redis_connections():
-        while True:
+    while True:
+        try:
+            # Get a fresh pool manager instance
+            pool_manager = await get_redis_connections()
+
+            # Actively test all connections to find failures quickly
+            connection_status = {
+                "order_master": False,
+                "order_slave": False,
+                "saga_master": False,
+                "saga_slave": False
+            }
+
+            # Test master connections
             try:
-                pool_manager = await get_redis_connections()
-                await pool_manager.reset_connections()
-                await get_redis_connections()
-                try:
-                    await db_master.ping()
-                    await db_slave.ping()
-                    await db_master_saga.ping()
-                    await db_slave_saga.ping()
-                    logging.info("Redis connections refreshed successfully")
-                except Exception as e:
-                    logging.error(f"Error pinging Redis after refresh: {str(e)}")
-                    await asyncio.sleep(2)
-                    continue
-
+                await db_master.ping()
+                connection_status["order_master"] = True
             except Exception as e:
-                logging.error(f"Error refreshing Redis connections: {str(e)}")
+                logging.warning(f"Order master connection failed: {e} - Possible failover situation!")
 
-            await asyncio.sleep(10)
+            try:
+                await db_slave.ping()
+                connection_status["order_slave"] = True
+            except Exception as e:
+                logging.warning(f"Order slave connection failed: {e}")
+
+            try:
+                await db_master_saga.ping()
+                connection_status["saga_master"] = True
+            except Exception as e:
+                logging.warning(f"Saga master connection failed: {e}")
+
+            try:
+                await db_slave_saga.ping()
+                connection_status["saga_slave"] = True
+            except Exception as e:
+                logging.warning(f"Saga slave connection failed: {e}")
+
+            # If ANY connection is down, force a full refresh of all connections
+            if not all(connection_status.values()):
+                logging.warning(f"Connection issues detected! Status: {connection_status}")
+                # Reset all Sentinel knowledge and reconnect everything
+                await pool_manager.reset_connections()
+                # Get fresh connections
+                await get_redis_connections()
+                logging.info("All Redis connections refreshed after detecting connection issues")
+
+        except Exception as e:
+            logging.error(f"Error in refresh_redis_connections: {str(e)}")
+
+        # Check connections every 3 seconds - aggressive monitoring
+        await asyncio.sleep(3)
 async def main():
    try:
     await get_redis_connections()
