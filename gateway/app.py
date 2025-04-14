@@ -32,13 +32,13 @@ async def handle_rpc_response(rpc_result):
                  status_code = 500
 
             logger.info(f"Gateway received structured response: Status={status_code}, Data/Error={response_data}")
-            return response_data, status_code
+            return jsonify(response_data), status_code
         else:
             logger.error(f"Gateway received improperly structured response from worker: {rpc_result}")
-            return {"error": "Internal Server Error - Malformed worker response"}, 500
+            return jsonify({"error": "Internal Server Error - Malformed worker response"}), 500
     else:
         logger.error(f"Gateway received unexpected response format: {type(rpc_result)} - {rpc_result}")
-        return {"error": "Internal Server Error - Invalid response format from worker"}, 500
+        return jsonify({"error": "Internal Server Error - Invalid response format from worker"}), 500
 
 # payload key
 def ensure_idempotency_key() -> str:
@@ -139,7 +139,7 @@ async def subtract_stock(item_id, amount):
     result = await rpc_client.call(queue="stock_queue", action="remove_stock", payload=payload)
     return await handle_rpc_response(result)
 
-@app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
+@app.route("/stock/batch_init/<n>/<starting_stock>/<item_price>", methods=["POST"])
 async def batch_init(n,starting_stock,item_price):
     payload = {
         "n": n,

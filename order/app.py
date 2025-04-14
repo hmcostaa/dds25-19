@@ -391,12 +391,11 @@ async def get_order_from_db(order_id: str) -> Tuple[Union[OrderValue, Dict], int
         return {"error": DB_ERROR_STR}, 400
 
 @worker.register
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-    n = int(n)
-    n_items = int(n_items)
-    n_users = int(n_users)
-    item_price = int(item_price)
+async def batch_init_orders(data: dict, message):
+    n = int(data['n_orders'])
+    n_items = int(data['n_items'])
+    n_users = int(data['n_users'])
+    item_price = int(data['item_price'])
 
     def generate_entry() -> OrderValue:
         user_id = random.randint(0, n_users - 1)
