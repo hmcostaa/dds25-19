@@ -271,5 +271,9 @@ async def order_batch_init(num_orders, num_items, num_users, item_price):
         logger.exception(f"Gateway: Error processing /orders/batch_init: {e}")
         return {"error": "Internal Server Error during order batch initialization"}, 500
 
+@app.route("/health")
+def health():
+    return "OK", 200
+
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=5000)

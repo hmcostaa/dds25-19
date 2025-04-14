@@ -58,7 +58,7 @@ services:
     volumes:
       - ./common:/usr/src/app/common
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -77,9 +77,9 @@ services:
       - redis-cluster-network
     depends_on:
        gateway1:
-          condition: service_started
+          condition: service_healthy
        gateway2:
-          condition: service_started
+          condition: service_healthy
   # ------------------------- Redis Sentinel Cluster ----------------------------
   redis-sentinel-1:
     image: redis:7.2-bookworm
