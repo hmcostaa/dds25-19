@@ -14,16 +14,16 @@ from msgspec import  DecodeError as MsgspecDecodeError
 from typing import  Tuple, Dict,  Union
 from common.rpc_client import RpcClient
 from common.amqp_worker import AMQPWorker
-
+from redis_pool_manager import RedisPoolManager, IdempotencyRedisProxy
 import requests
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort
 import warnings
 
-import redis.asyncio as redis
+import redis  # Standard Redis for exceptions
+import redis.asyncio as aioredis  # Async Redis for async operations
 from redis.asyncio.sentinel import Sentinel
-import redis
 
 from global_idempotency.idempotency_decorator import idempotent
 
@@ -44,31 +44,53 @@ logging =logging.getLogger("order-service")
 app = Flask("order-service")
 
 
-sentinel_async = Sentinel([
-    (os.environ['REDIS_SENTINEL_1'], 26379),
-    (os.environ['REDIS_SENTINEL_2'], 26379),
-    (os.environ['REDIS_SENTINEL_3'], 26379)], #TODO 26379 for evey sentinel now
-    socket_timeout=10, #TODO check if it can be lowered
-    socket_connect_timeout=5,
-    socket_keepalive=True,
-    password=os.environ['REDIS_PASSWORD']
-)
-
-
-db_master = sentinel_async.master_for('order-master', decode_responses=False)
-db_slave = sentinel_async.slave_for('order-master', socket_timeout=10, decode_responses=False)
-db_master_saga = sentinel_async.master_for('saga-master', socket_timeout=10, decode_responses=False)
-db_slave_saga = sentinel_async.slave_for('saga-master', socket_timeout=10, decode_responses=False)
-
-#changed.. now saga master is used for idempotency as centralized client
-# Read connection details from environment variables
-
-idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)) 
-idempotency_redis_client = sentinel_async.master_for(
-    "saga-master",
-    decode_responses=False,
-    db=idempotency_redis_db
-)
+# sentinel_async = Sentinel([
+#     (os.environ['REDIS_SENTINEL_1'], 26379),
+#     (os.environ['REDIS_SENTINEL_2'], 26379),
+#     (os.environ['REDIS_SENTINEL_3'], 26379)],
+#     socket_timeout=10, #TODO check if it can be lowered
+#     socket_connect_timeout=5,
+#     socket_keepalive=True,
+#     password=os.environ['REDIS_PASSWORD'],
+#     retry_on_timeout=True
+# )
+#
+#
+# db_master = sentinel_async.master_for('order-master', decode_responses=False)
+# db_slave = sentinel_async.slave_for('order-master', socket_timeout=10, decode_responses=False)
+# db_master_saga = sentinel_async.master_for('saga-master', socket_timeout=10, decode_responses=False)
+# db_slave_saga = sentinel_async.slave_for('saga-master', socket_timeout=10, decode_responses=False)
+#
+# # Add this after line 60 (after creating the sentinel_async)
+# #changed.. now saga master is used for idempotency as centralized client
+# # Read connection details from environment variables
+#
+# idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+# idempotency_redis_client = sentinel_async.master_for(
+#     "saga-master",
+#     decode_responses=False,
+#     db=idempotency_redis_db
+# )
+idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+idempotency_redis_client = IdempotencyRedisProxy.get_instance()
+IdempotencyRedisProxy.configure('saga-master', idempotency_redis_db)
+async def get_redis_connections():
+    global db_master, db_slave, db_master_saga, db_slave_saga, idempotency_redis_client
+    sentinel_hosts = [
+        (os.environ['REDIS_SENTINEL_1'], 26379),
+        (os.environ['REDIS_SENTINEL_2'], 26379),
+        (os.environ['REDIS_SENTINEL_3'], 26379)
+    ]
+    pool_manager = await RedisPoolManager.get_instance(
+        sentinel_hosts=sentinel_hosts,
+        password=os.environ['REDIS_PASSWORD']
+    )
+    db_master = await pool_manager.get_master('order-master', decode_responses=False)
+    db_slave = await pool_manager.get_slave('order-master', decode_responses=False)
+    db_master_saga = await pool_manager.get_master('saga-master', decode_responses=False)
+    db_slave_saga = await pool_manager.get_slave('saga-master', decode_responses=False)
+    await IdempotencyRedisProxy.initialize(pool_manager)
+    return pool_manager
 
 SERVICE_ID = str(uuid.uuid4())
 ORCHESTRATOR_ID = str(uuid.uuid4())
@@ -82,6 +104,7 @@ OUTBOX_KEY="outbox:order"
 saga_futures={}
 pubsub_clients={}
 listener_tasks={}
+
 
 async def cleanup_pubsub_resource():
     logging.info("Cleaning up Redis PubSub resources.")
@@ -107,6 +130,27 @@ def register_original(name=None):
 
     return decorator
 
+
+
+def redis_operation_with_retry(max_retries=3, backoff_ms=200):
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return await func(*args, **kwargs)
+                except (redis.ConnectionError, redis.TimeoutError) as e:
+                    last_exception = e
+                    logging.warning(f"Redis connection error on attempt {attempt + 1}/{max_retries}: {str(e)}")
+                    await get_redis_connections()
+                    wait_time = (backoff_ms * (2 ** attempt)) / 1000
+                    await asyncio.sleep(wait_time)
+            raise last_exception
+
+        return wrapper
+
+    return decorator
 
 async def start_pubsub_listener(saga_id: str)->asyncio.Task:
     notification_channel=f"saga_completion:{saga_id}"
@@ -335,9 +379,9 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
                logging.info(
                    f"[Order Orchestrator Atomic] Saga {saga_id} updated -> {status}. Enqueued message to outbox")
                return True
-       except redis.exceptions.WatchError:
+       except redis.WatchError:
            logging.warning(f"[SAGA UPDATE] Retry {attempt+1}/{max_attempts}. Saga {saga_id} failed to update. WatchError on {saga_id}")
-       except redis.exceptions.RedisError as e:
+       except redis.RedisError as e:
            logging.error(f"[SAGA UPDATE] Redis error on attempt {attempt+1}: {e}")
            logging.error (f"Error redis update saga state {saga_id} to {status}: {str(e)}")
            await asyncio.sleep(backoff_ms/1000)
@@ -348,13 +392,25 @@ async def update_saga_and_enqueue(saga_id, status,  routing_key: str|None, paylo
     return False
 
 async def close_db_connection():
-    await db_master.close()
-    await db_slave.close()
-    await db_master_saga.close()
-    await db_slave_saga.close()
-    await cleanup_pubsub_resource()
-    await idempotency_redis_client.close()
+    try:
+        sentinel_hosts = [
+            (os.environ['REDIS_SENTINEL_1'], 26379),
+            (os.environ['REDIS_SENTINEL_2'], 26379),
+            (os.environ['REDIS_SENTINEL_3'], 26379)
+        ]
 
+        pool_manager = await RedisPoolManager.get_instance(
+            sentinel_hosts=sentinel_hosts,
+            password=os.environ['REDIS_PASSWORD'],
+            force_refresh=True
+        )
+
+        await pool_manager.close_all()
+        await cleanup_pubsub_resource()
+
+        logging.info("All Redis connections closed properly")
+    except Exception as e:
+        logging.error(f"Error closing Redis connections: {str(e)}")
 
 
 
@@ -364,7 +420,7 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
-
+@redis_operation_with_retry()
 async def get_order_from_db(order_id: str) -> Tuple[Union[OrderValue, Dict], int]: 
     try:
         # get serialized data
@@ -418,7 +474,7 @@ async def batch_init_orders(data: dict, message):
 
 
 
-
+@redis_operation_with_retry()
 async def get_saga_state(saga_id: str) -> str:
     try:
         saga_key = f"saga:{saga_id}"
@@ -1750,9 +1806,30 @@ async def health_check_server():
     await site.start()
     logging.info("[Order Orchestrator] Health check server started on :8000")
 
+async def refresh_redis_connections():
+        while True:
+            try:
+                pool_manager = await get_redis_connections()
+                await pool_manager.reset_connections()
+                await get_redis_connections()
+                try:
+                    await db_master.ping()
+                    await db_slave.ping()
+                    await db_master_saga.ping()
+                    await db_slave_saga.ping()
+                    logging.info("Redis connections refreshed successfully")
+                except Exception as e:
+                    logging.error(f"Error pinging Redis after refresh: {str(e)}")
+                    await asyncio.sleep(2)
+                    continue
 
+            except Exception as e:
+                logging.error(f"Error refreshing Redis connections: {str(e)}")
+
+            await asyncio.sleep(10)
 async def main():
    try:
+    await get_redis_connections()
     await connect_rpc_client()
     asyncio.create_task(health_check_server())
     asyncio.create_task(consume_messages())
@@ -1760,6 +1837,7 @@ async def main():
     asyncio.create_task(recover_in_progress_sagas())
     asyncio.create_task(outbox_poller())
     asyncio.create_task(periodic_lock_cleanup())
+    asyncio.create_task(refresh_redis_connections())
 
     await worker.start()
    finally:

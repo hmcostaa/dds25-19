@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import logging
 import redis.asyncio as redis
@@ -134,13 +135,13 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
                     except (MsgspecEncodeError, TypeError, ValueError) as e:
                         logger.error(f"error encoding result tuple for key {redis_key}: {e}")
                         return {"error": "Idempotency error"}, 500
-                    except redis.exceptions.RedisError as e:
+                    except redis.RedisError as e:
                         logger.erro(f"Redis error storing result tuple for key {redis_key}: {e}")
                         return {"error": "Idempotency store error"}, 503
                     
                     return result_tuple
             
-            except redis.exceptions.RedisError as e:
+            except redis.RedisError as e:
                 logger.error(f"Redis error getting cache_bytes for key {redis_key}: {e}")
                 return {"error": "Idempotency error"}, 503
             except Exception as e:
