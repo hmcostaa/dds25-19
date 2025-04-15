@@ -1465,7 +1465,7 @@ async def recover_in_progress_sagas():
                     
     except Exception as e:
         print(f"!!! ERROR INSIDE recover_in_progress_sagas: {e}", flush=True)
-        logging.error(f"Error recovering sagas: {str(e)}", exec_info=True)
+        logging.error(f"Error recovering sagas: {str(e)}", exc_info=True)
 
 
 
