@@ -5,10 +5,32 @@ Basic project structure with Python's Flask and Redis.
 
 # System Architecture Summary
 
-The system is composed of three asynchronous services -- Order Service as SAGA Orchestrator, Stock Service, and Payment Service. The Order Service acts as a SAGA Orchestrator. Whenever a failure occurs in the system, the order service will compensate the failed transaction by sending commands to Stock and Payment services via RabbitMQ. Within each service, there is a designated Leader Replica responsible for handling all write operations within that service, ensuring consistency and atomic updates, while other replicas provide high availability to the system and Redis Sentinels provide failover support by automatically promoting a Follower Replica to Leader if the current Leader fails. Data persistence for each service (orders, stock, payments) relies on separate Redis master-replica sets managed by Redis Sentinel for high availability and failover. Consistency is enforced through atomic updates using Redis WATCH/MULTI/EXEC transactions within each service and idempotency keys backed by the shared saga Redis instance.
+The system is composed of three asynchronous services -- Order Service as SAGA Orchestrator, Stock Service, and Payment Service. The Order Service acts as a SAGA Orchestrator. Client requests typically enter through a load-balanced API Gateway, which communicates with the services. High availability is also provided at the entry point by load-balancing requests across multiple API Gateway instances using Nginx. ata persistence relies on dedicated Redis master-replica sets for each service (orders, stock, payments). High availability and failover for these data stores are managed by Redis Sentinel, which handles master election for write operations. A separate Redis instance stores SAGA state and supports idempotency checks.
 
+Consistency within each service's data operations is enforced using atomic Redis transactions (WATCH/MULTI/EXEC). Idempotency for critical operations is ensured via an @idempotent decorator backed by the shared Redis instance.
+
+While internal communication is asynchronous, the main checkout endpoint provides a synchronous-style response. The Order Service waits for the SAGA's final outcome (notified via Redis Pub/Sub) before returning a result to the gateway, masking the internal async nature from the client.
+
+Even though, the system is designed to recover from individual service or database node failures, the consistency test is particularly sensitive to failures in the RabbitMQ message broker during transaction coordination.
 ## Contributions
+**[Nawmi (@NawmiNujhat) & Emiel (@emiel171)]**:
+Initial Architecture Contributions
+* Core Logic Refinement (Order, Payment, Stock Services)
+* SAGA Orchestration Refinement & Idempotency Module
+* AMQP Worker/RPC Client
+* Testing (Unit, Integration, Benchmark Analysis)
+* Final Debugging
 
+**[Henrique (@hmcostaa)]**:
+* Initial Contribution: Participated in early architecture discussions and service setup
+
+**[Dimitris (@dntatsis)]:**
+* Initial Contribution: Participated in early architecture discussions and service setup.
+
+**[Dennis (@)denheijmans]:**
+* Initial Contribution: Participated in early architecture discussions and service setup.
+
+Detailed code changes and commit history can be viewed in the Git log
 
 ## Testing
 * Install python 3.8 or greater (tested with 3.10 on Windows 11)
