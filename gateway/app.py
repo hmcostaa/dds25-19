@@ -32,13 +32,13 @@ async def handle_rpc_response(rpc_result):
                  status_code = 500
 
             logger.info(f"Gateway received structured response: Status={status_code}, Data/Error={response_data}")
-            return response_data, status_code
+            return jsonify(response_data), status_code
         else:
             logger.error(f"Gateway received improperly structured response from worker: {rpc_result}")
-            return {"error": "Internal Server Error - Malformed worker response"}, 500
+            return jsonify({"error": "Internal Server Error - Malformed worker response"}), 500
     else:
         logger.error(f"Gateway received unexpected response format: {type(rpc_result)} - {rpc_result}")
-        return {"error": "Internal Server Error - Invalid response format from worker"}, 500
+        return jsonify({"error": "Internal Server Error - Invalid response format from worker"}), 500
 
 # payload key
 def ensure_idempotency_key() -> str:
@@ -139,7 +139,7 @@ async def subtract_stock(item_id, amount):
     result = await rpc_client.call(queue="stock_queue", action="remove_stock", payload=payload)
     return await handle_rpc_response(result)
 
-@app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
+@app.route("/stock/batch_init/<n>/<starting_stock>/<item_price>", methods=["POST"])
 async def batch_init(n,starting_stock,item_price):
     payload = {
         "n": n,
@@ -195,5 +195,85 @@ async def find_user(user_id):
                                            payload={"user_id": user_id})
     return await handle_rpc_response(result)
 
+@app.route("/payment/batch_init/<num_users>/<start_credit>", methods=["POST"])
+async def payment_batch_init(num_users, start_credit):
+    try:
+        payload = {
+            "n": int(num_users), 
+            "starting_money": int(start_credit) 
+        }
+        logger.debug(f"Gateway: Calling payment_queue RPC action 'batch_init_users' with payload: {payload}")
+
+        result = await rpc_client.call(queue="payment_queue",
+                                       action="batch_init_users",
+                                       payload=payload)
+
+        logger.debug(f"Gateway: Received RPC result for batch_init_users: {result}")
+        return await handle_rpc_response(result)
+
+    except ValueError:
+        logger.error(f"Gateway: Invalid non-integer parameters received: num_users='{num_users}', start_credit='{start_credit}'")
+        return {"error": "Invalid parameters: num_users and start_credit must be integers."}, 400
+    except Exception as e:
+        logger.exception(f"Gateway: Error processing /payment/batch_init: {e}")
+        return {"error": "Internal Server Error during batch initialization"}, 500
+
+# @app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
+# async def batch_init(n, starting_stock, item_price):
+#     logger.info(f"Gateway: Entered /stock/batch/ handler with n={n}, stock={starting_stock}, price={item_price}")
+#     try:
+#         # Convert parameters to integers
+#         payload = {
+#             "n": int(n),
+#             "starting_stock": int(starting_stock),
+#             "item_price": int(item_price)
+#         }
+
+#         logger.info(f"Gateway: Prepared payload for stock_batch_init: {payload}")
+#         logger.info("Gateway: About to call RPC for batch_init_stock...")
+
+#         result = await rpc_client.call(queue="stock_queue",
+#                                        action="batch_init_stock",
+#                                        payload=payload)
+
+#         logger.info(f"Gateway: RPC call for batch_init_stock returned. Result: {result}")
+#         return await handle_rpc_response(result)
+
+#     except ValueError:
+#         logger.exception(f"Gateway: Unhandled exception in /stock/batch/ handler: {e}")
+#         return {"error": "Internal Server Error during stock batch initialization"}, 500
+#     except Exception as e:
+#         logger.exception(f"Gateway: Unhandled exception in /stock/batch/ handler: {e}")
+#         return {"error": "Internal Server Error during stock batch initialization"}, 500
+    
+@app.route("/orders/batch_init/<num_orders>/<num_items>/<num_users>/<item_price>", methods=["POST"])
+async def order_batch_init(num_orders, num_items, num_users, item_price):
+    try:    
+        payload = {
+            "n_orders": int(num_orders),
+            "n_items": int(num_items),
+            "n_users": int(num_users),
+            "item_price": int(item_price)
+        }
+        logger.debug(f"Gateway: Calling order_queue RPC action 'batch_init_orders' with payload: {payload}")
+
+        result = await rpc_client.call(queue="order_queue",
+                                       action="batch_init_orders", 
+                                       payload=payload)
+
+        logger.debug(f"Gateway: Received RPC result for batch_init_orders: {result}")
+        return await handle_rpc_response(result)
+
+    except ValueError:
+        logger.error(f"Gateway: Invalid non-integer parameters received in order batch init")
+        return {"error": "Invalid parameters: URL path parameters must be integers."}, 400
+    except Exception as e:
+        logger.exception(f"Gateway: Error processing /orders/batch_init: {e}")
+        return {"error": "Internal Server Error during order batch initialization"}, 500
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=5000)

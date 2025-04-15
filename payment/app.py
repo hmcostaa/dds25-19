@@ -12,6 +12,7 @@ from flask import Flask, jsonify, abort, Response
 from typing import Optional, Tuple, Any, Union, Tuple, Dict
 from redis.exceptions import WatchError, RedisError
 import random
+import time
 import logging
 
 from global_idempotency.idempotency_decorator import idempotent
@@ -239,8 +240,6 @@ async def add_funds(data, message) -> IdempotencyResultTuple:
         return user
     
     
-    # decorator now handles try except
-    # atomic_update_user(data["user_id"], updater)
     updated_user, error_msg = await atomic_update_user(user_id, updater)
 
     if error_msg:
@@ -306,23 +305,151 @@ async def pay(data, message) -> IdempotencyResultTuple:
 @worker.register
 @idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME)
 async def remove_credit(data, message)-> IdempotencyResultTuple:
+    """
+    Remove credit from a user's account as part of a payment process.
+    Returns a tuple of (data_dict, status_code) for idempotency handling.
+    """
+    logging.info(f"[PAYMENT] Starting remove_credit operation")
+    
     user_id = data.get("user_id")
-    amount = data.get("amount")
+    raw_amount = data.get("amount")
+    saga_id = data.get("saga_id")
+    order_id = data.get("order_id")
+    callback_action = data.get("callback_action")
+    
+    correlation_id = getattr(message, "correlation_id", "unknown")
+    logging.info(f"[PAYMENT] Processing remove_credit: user_id={user_id}, amount={raw_amount}, saga_id={saga_id}, order_id={order_id}")
+    logging.debug(f"[PAYMENT] Correlation ID: {correlation_id}, Callback action: {callback_action}")
+    logging.debug(f"[PAYMENT] Full request data: {data}")
+    
+    try:
+        logging.debug(f"[PAYMENT] Converting amount '{raw_amount}' to integer")
+        amount = int(raw_amount)
+        logging.debug(f"[PAYMENT] Amount conversion successful: {amount}")
+    except (ValueError, TypeError) as e:
+        error_msg = f"Invalid amount '{raw_amount}'"
+        logging.error(f"[PAYMENT] {error_msg}: {str(e)}")
+        logging.debug(f"[PAYMENT] Amount type: {type(raw_amount)}")
+        return {"error": error_msg}, 400
 
-    if not user_id or amount <= 0:
-        return {"error": "Invalid request"}, 400
+    if not user_id:
+        logging.error("[PAYMENT] Missing required field: user_id")
+        return {"error": "Invalid request (missing user_id or amount <= 0)"}, 400
+        
+    if amount <= 0:
+        logging.error(f"[PAYMENT] Invalid amount: {amount} <= 0")
+        return {"error": "Invalid request (missing user_id or amount <= 0)"}, 400
+    
+    logging.info(f"[PAYMENT] Validation passed for user_id={user_id}, amount={amount}")
 
     def updater(user: UserValue) -> UserValue:
+        logging.debug(f"[PAYMENT] User before update: user_id={user_id}, credit={user.credit}")
         if user.credit < amount:
+            logging.warning(f"[PAYMENT] Insufficient funds: user_id={user_id}, credit={user.credit}, amount={amount}")
             raise ValueError("Insufficient funds")
+        
+        old_credit = user.credit
         user.credit -= amount
+        logging.info(f"[PAYMENT] Credit updated: user_id={user_id}, old_credit={old_credit}, new_credit={user.credit}, amount_deducted={amount}")
         return user
 
+    logging.debug(f"[PAYMENT] Calling atomic_update_user for user_id={user_id}")
+    start_time = time.time()
     updated_user, error_msg = await atomic_update_user(user_id, updater)
-
+    execution_time = time.time() - start_time
+    logging.debug(f"[PAYMENT] atomic_update_user completed in {execution_time:.3f}s")
+    
     if error_msg:
-        return {"error": error_msg}, 400
-    return {"msg": f"Removed {amount} from user {user_id}"}, 200
+        logging.error(f"[PAYMENT] Failed to update user: {error_msg}")
+        
+        if saga_id and order_id:
+            logging.info(f"[PAYMENT] Preparing failure notification for saga_id={saga_id}, order_id={order_id}")
+            try:
+                reply_to_queue = getattr(message, "reply_to", "orchestrator_queue")
+                if not reply_to_queue:
+                    reply_to_queue = "orchestrator_queue"
+                    logging.warning(f"[PAYMENT] Reply to queue not provided, using default: {reply_to_queue}")
+                else:
+                    logging.info(f"[PAYMENT] Reply to queue provided: {reply_to_queue}")
+
+                logging.debug(f"[PAYMENT] Constructing failure payload for saga_id={saga_id}")
+                failure_payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "error": error_msg,
+                    "success": False,
+                    "callback_action": callback_action or "process_payment_completed"  
+                }
+                logging.debug(f"[PAYMENT] Failure payload: {failure_payload}")
+
+                logging.info(f"[PAYMENT] Sending failure message to queue={reply_to_queue}, correlation_id={saga_id}")
+                await worker.send_message(
+                    payload=failure_payload,
+                    queue=reply_to_queue,
+                    correlation_id=saga_id,
+                    action="process_payment_completed",
+                    callback_action="process_payment_completed",
+                    reply_to=reply_to_queue
+                )
+                logging.info(f"[PAYMENT] Sent payment failure notification for saga {saga_id}")
+            except Exception as e:
+                logging.error(f"[PAYMENT] Failed to send failure notification: {str(e)}", exc_info=True)
+                
+        logging.debug(f"[PAYMENT] Returning error response with status code 400")
+        return ({"error": error_msg}, 400)
+
+    if updated_user:
+        logging.info(f"[PAYMENT] Successfully updated user_id={user_id}, new_credit={updated_user.credit}")
+        
+        if saga_id and order_id and getattr(message, "reply_to", None):
+            try:
+                reply_to_queue = message.reply_to
+                logging.info(f"[PAYMENT] Attempting direct success reply to {reply_to_queue} for saga {saga_id}")
+                
+                direct_success_payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "success": True,
+                    "credit": updated_user.credit,
+                    "callback_action": callback_action or "process_payment_completed"
+                }
+                logging.debug(f"[PAYMENT] Direct success payload: {direct_success_payload}")
+                
+                logging.info(f"[PAYMENT] Sending direct success message to queue={reply_to_queue}, correlation_id={saga_id}")
+                await worker.send_message(
+                    payload=direct_success_payload,
+                    queue=reply_to_queue,
+                    correlation_id=saga_id,
+                    action="process_payment_completed",
+                    callback_action="process_payment_completed",
+                    reply_to=None
+                )
+                logging.info(f"[PAYMENT] Sent direct payment completion notification for saga {saga_id}")
+            except Exception as e:
+                logging.error(f"[PAYMENT] Failed to send direct success notification: {str(e)}", exc_info=True)
+
+        logging.debug(f"[PAYMENT] Constructing success response")
+        success_data = {
+            "message": f"Removed {amount} from user {user_id}",
+            "credit": updated_user.credit,
+            "saga_id": saga_id,  
+            "order_id": order_id,
+            "callback_action": callback_action or "process_payment_completed"
+        }
+        logging.info(f"[PAYMENT] Operation completed successfully for user_id={user_id}, saga_id={saga_id}")
+        return (success_data, 200) 
+    else:
+        logging.error(f"[PAYMENT] Failed to update user {user_id}, unknown reason")
+        error_data = {"error": "Failed to update user, unknown reason"}
+        if saga_id: 
+            error_data["saga_id"] = saga_id
+            logging.debug(f"[PAYMENT] Added saga_id={saga_id} to error response")
+        if order_id: 
+            error_data["order_id"] = order_id
+            logging.debug(f"[PAYMENT] Added order_id={order_id} to error response")
+        
+        logging.debug(f"[PAYMENT] Returning error response with status code 500: {error_data}")
+        return (error_data, 500)
 
 @worker.register
 @idempotent('compensate', idempotency_redis_client, SERVICE_NAME)
@@ -330,28 +457,50 @@ async def compensate(data, message):
     try:
         user_id = data.get("user_id")
         amount = data.get("amount")
+        saga_id = data.get("saga_id")
+        order_id = data.get("order_id")
 
         if not all([user_id, amount is not None]):
             logging.error("Missing user_id or amount in cancel_payment request.")
             return {"error": "Missing required fields"}, 400
-        
+
         if int(amount) <= 0:
             return {"error": "Transaction amount must be positive"}, 400
-        
+
     except (ValueError, TypeError):
         return {"error": "Invalid amount specified"}, 400
-    
+
     def updater(user: UserValue) -> UserValue:
         user.credit += amount
         return user
-    
+
     try:
         updated_user, error_msg = await atomic_update_user(user_id, updater)
         if error_msg:
             logging.error(f"Failed to cancel payment (refund) for user {user_id}: {error_msg}")
             status_code = 404 if "not found" in error_msg.lower() else 500
             return {"error": f"Failed to cancel payment: {error_msg}"}, status_code
+
         if updated_user:
+            if saga_id and order_id:
+                try:
+                    await worker.send_message(
+                        payload={
+                            "saga_id": saga_id,
+                            "order_id": order_id,
+                            "success": True,
+                            "message": f"Successfully refunded {amount} to user {user_id}",
+                            "callback_action": "process_compensation_completed"
+                        },
+                        queue="orchestrator_queue",
+                        correlation_id=saga_id,
+                        action="process_compensation_completed",
+                        callback_action="process_compensation_completed"
+                    )
+                    logging.info(f"[Payment] Sent compensation completion notification for saga {saga_id}")
+                except Exception as e:
+                    logging.error(f"[Payment] Failed to send compensation notification: {e}")
+
             return {"refunded": True, "credit": updated_user.credit}, 200
         else:
             logging.error(f"Cancel payment failed for user {user_id}, unknown reason .")
@@ -359,7 +508,6 @@ async def compensate(data, message):
     except Exception as e:
         logging.exception("Error canceling payment for user %s: %s", user_id, e)
         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
-
 async def main():
     try:
         await worker.start()

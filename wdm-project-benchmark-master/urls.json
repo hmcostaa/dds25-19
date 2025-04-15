@@ -1,0 +1,5 @@
+{
+  "ORDER_URL" : "http://localhost:8080",
+  "PAYMENT_URL" : "http://localhost:8080",
+  "STOCK_URL" : "http://localhost:8080"
+}

@@ -39,6 +39,7 @@ class AMQPWorker:
             raise ValueError(f"Provided callback '{callback}' is not callable.")
         
         #check for asyn func??
+        is_async = inspect.iscoroutinefunction(callback)
         message_type = callback.__name__ 
         self.callbacks[message_type] = callback
         logging.info(f"Registered callback for message type: '{message_type}'")
@@ -90,59 +91,73 @@ class AMQPWorker:
             logger.warning(f"No reply_to queue specified for CorrID {correlation_id}, reply not sent.")
 
     async def start(self):
-        """
-        Start consuming messages from the queue.
-        """
-        self.connection = await connect_robust(self.amqp_url)
-        async with self.connection:
-            self.channel = await self.connection.channel()
-            await self.channel.set_qos(prefetch_count=1)
-
-            dlx_name = f"{self.queue_name}.dlx"
-            dlq_name = f"{self.queue_name}.dlq"
-            dlq_routing_key = dlq_name
-
-            dlx = await self.channel.declare_exchange(
-                dlx_name,
-                type="direct",
-                durable=True,
-            )
-
-            dlq = await self.channel.declare_queue(
-                dlq_name,
-                durable=True,
-            )
-
-            logger.info(f"Declared DLX '{dlx_name}' and DLQ '{dlq_name}'")
-
-            await dlq.bind(exchange=dlx, routing_key=dlq_routing_key)
+        logger.info(f"Starting AMQPWorker for queue: {self.queue_name}")
+        try:
+            self.connection = await connect_robust(self.amqp_url)
             
-            main_queue_arguments = {
-                "x-dead-letter-exchange": dlx_name,
-                "x-dead-letter-routing-key": dlq_routing_key
-            }
-            
+            async with self.connection:
+                self.channel = await self.connection.channel()
+                
+                await self.channel.set_qos(prefetch_count=1)
 
-            queue = await self.channel.declare_queue(
-                self.queue_name,
-                durable=True,
-                arguments=main_queue_arguments
-            )
+                dlx_name = f"{self.queue_name}.dlx"
+                dlq_name = f"{self.queue_name}.dlq"
+                dlq_routing_key = dlq_name
 
-            logger.info(f"Declared queue '{self.queue_name}' linked to DLX '{dlx_name}'")
-            
-            # #manual ack
-            # if self._use_manual_acks:
-            await queue.consume(self.on_message, no_ack=False)
-            logger.info(" [*] Waiting for messages. To exit press CTRL+C")
-            await asyncio.Future()
+                logger.info(f"Setting up dead letter exchange: {dlx_name} and queue: {dlq_name}")
+                dlx = await self.channel.declare_exchange(
+                    dlx_name,
+                    type="direct",
+                    durable=True,
+                )
+                logger.debug(f"DLX '{dlx_name}' declared successfully")
+
+                dlq = await self.channel.declare_queue(
+                    dlq_name,
+                    durable=True,
+                )
+                logger.debug(f"DLQ '{dlq_name}' declared successfully")
+
+                logger.info(f"Declared DLX '{dlx_name}' and DLQ '{dlq_name}'")
+
+                logger.debug(f"Binding DLQ '{dlq_name}' to DLX '{dlx_name}' with routing key '{dlq_routing_key}'")
+                await dlq.bind(exchange=dlx, routing_key=dlq_routing_key)
+                logger.debug(f"DLQ binding completed")
+                
+                main_queue_arguments = {
+                    "x-dead-letter-exchange": dlx_name,
+                    "x-dead-letter-routing-key": dlq_routing_key
+                }
+                logger.debug(f"Main queue arguments: {main_queue_arguments}")
+                
+
+                logger.info(f"Declaring main queue: {self.queue_name}")
+                queue = await self.channel.declare_queue(
+                    self.queue_name,
+                    durable=True,
+                    arguments=main_queue_arguments
+                )
+                logger.debug(f"Main queue declared with arguments: {main_queue_arguments}")
+
+                logger.info(f"Declared queue '{self.queue_name}' linked to DLX '{dlx_name}'")
+                
+                # #manual ack
+                # if self._use_manual_acks:
+                logger.info(f"Starting to consume from queue: {self.queue_name} with manual acknowledgment")
+                await queue.consume(self.on_message, no_ack=False)
+                
+                await asyncio.Future()
+        except Exception as e:
+            logger.critical(f"Failed to start AMQPWorker: {str(e)}", exc_info=True)
+            raise
+
 
 
     async def on_message(self, message:AbstractIncomingMessage):
         """
         Manual ACK, for idempotency, still testing
         """
-
+        correlation_id = message.correlation_id or "no-correlation-id"
         response_tuple = None
         handler = None
         message_type = None
@@ -244,13 +259,23 @@ class AMQPWorker:
 
         correlation_id = correlation_id or str(uuid.uuid4())
 
-        await exchange.publish(
-            Message(
+        try:
+            message = Message(
                 body=json.dumps(payload).encode(),
                 correlation_id=correlation_id,
                 type=action,
                 reply_to=reply_to,
                 delivery_mode=DeliveryMode.PERSISTENT #avpoids loss of messages, lower throughput, but reliable
-            ),
-            routing_key=queue,
-        )
+            )
+            logger.debug(f"Created message object with delivery_mode=PERSISTENT")
+            
+            await exchange.publish(
+                message,
+                routing_key=queue,
+            )
+            logger.info(f"Message published successfully to queue '{queue}' with correlation_id '{correlation_id}'")
+        except Exception as e:
+            logger.error(f"Failed to publish message to '{queue}': {str(e)}", exc_info=True)
+            raise
+
+
