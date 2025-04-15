@@ -142,7 +142,7 @@ services:
   redis-order-master:
     image: redis:7.2-bookworm
     container_name: redis-order-master
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    command: ["redis-server",  "--appendfsync", "everysec", "--requirepass", "redis"]
     ports:
       - "6379:6379"
     networks:
@@ -187,7 +187,7 @@ services:
   redis-stock-master:
     image: redis:7.2-bookworm
     container_name: redis-stock-master
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    command: ["redis-server",  "--appendfsync", "everysec", "--requirepass", "redis"]
     ports:
       - "6380:6379"
     networks:
@@ -232,7 +232,7 @@ services:
   redis-payment-master:
     image: redis:7.2-bookworm
     container_name: redis-payment-master
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    command: ["redis-server",  "--appendfsync", "everysec", "--requirepass", "redis"]
     ports:
       - "6381:6379"
     networks:
@@ -277,7 +277,7 @@ services:
   redis-saga-master:
     image: redis:7.2-bookworm
     container_name: redis-saga-master
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "redis"]
+    command: ["redis-server",  "--appendfsync", "everysec", "--requirepass", "redis"]
     ports:
       - "6382:6379"
     networks:
