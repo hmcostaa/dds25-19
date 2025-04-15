@@ -184,6 +184,9 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
     logging.debug(f"[ORCHESTRATOR] Fetching current saga state for saga_id={saga_id}")
     start_time = time.time()
     saga_data = await get_saga_state(saga_id)
+    if saga_data is None:
+        logging.error(f"Saga data missing after completion for {saga_id}")
+        return {"error": "Saga data missing after completion"}, 500
     fetch_time = time.time() - start_time
     logging.debug(f"[ORCHESTRATOR] Fetched saga state in {fetch_time:.3f}s")
     
@@ -205,11 +208,10 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
             logging.debug(f"[ORCHESTRATOR] Returning error response with status_code=400")
             return {"error": error_details}, 400
     else:
-    
-        saga_futures[saga_id] = asyncio.Future()
-        
-        await start_pubsub_listener(saga_id)
-        logging.debug(f"[ORCHESTRATOR] Started pubsub listener for saga_id={saga_id}")
+        if saga_id not in saga_futures:
+            saga_futures[saga_id] = asyncio.Future()
+            await start_pubsub_listener(saga_id)
+            logging.debug(f"[ORCHESTRATOR] Started pubsub listener for saga_id={saga_id}")
     
     try:
         logging.info(f"[ORCHESTRATOR] Waiting for saga {saga_id} to complete (timeout=2s)")
@@ -219,15 +221,11 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
         
         saga_result = saga_futures[saga_id].result()
         logging.info(f"[Order Orchestrator] Saga {saga_id} completed with result: {saga_result}")
-        
         if saga_result.get("success", False):
-            
-            # Extract order data
             order_data = saga_data.get("details", {})
             user_id = order_data.get("user_id")
             logging.debug(f"[ORCHESTRATOR] Order data: user_id={user_id}, order_details={order_data}")
-            
-            # Verify payment
+
             payment_verified = False
             for attempt in range(5):
                 
@@ -302,8 +300,14 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
         
     finally:
         if saga_id in saga_futures:
-            logging.debug(f"[ORCHESTRATOR] Removing future for saga {saga_id}")
-            del saga_futures[saga_id]
+            future = saga_futures[saga_id]
+            if future.done():
+                logging.debug(f"[ORCHESTRATOR] Removing future for completed saga {saga_id}")
+                del saga_futures[saga_id]
+            else:
+                logging.warning(f"[ORCHESTRATOR] Future for saga {saga_id} not completed, cancelling now.")
+                future.cancel()
+                del saga_futures[saga_id]
 
         if saga_id in listener_tasks and not listener_tasks[saga_id].done():
             logging.debug(f"[ORCHESTRATOR] Cancelling listener task for saga {saga_id}")
@@ -397,7 +401,8 @@ async def update_saga_and_enqueue(saga_id, status, routing_key: str|None, payloa
                 
                 pipe.multi()
                 await pipe.set(saga_key, json.dumps(saga_data), ex=SAGA_STATE_TTL)
-                
+                logging.debug(f"Saga data explicitly set for saga_id={saga_id}: {saga_data}")
+
                 if outbox_msg:
                     logging.info(f"[SAGA] Adding message to outbox queue for saga {saga_id}")
                     await pipe.rpush(OUTBOX_KEY, outbox_msg_json)
@@ -574,9 +579,7 @@ async def create_order(data, message):
 
         await update_saga_and_enqueue(saga_id=key, status="INITIATED", routing_key=None, payload=None)
         return {"order_id": key}, 200
-
-    
-    except redis.RedisError:
+    except redis.RedisError as e:
         logging.error(f"Redis error creating order {key} for user {user_id}: {e}")
         return {"error": "Redis error"}, 500
     except Exception as e:
@@ -722,25 +725,27 @@ async def process_checkout_request(data, message):
             status_code=200
         )
 
-    except Exception as e:
-        logging.error(f"Error in process_checkout_request: {str(e)}")
+    except Exception as original_exception:
+        logging.error(f"[Order Orchestrator] Exception raised: {original_exception}")
+        error_msg = str(original_exception)
+        logging.error(f"Error in process_checkout_request: {error_msg}")
         saga_id = locals().get("saga_id")
         if saga_id:
             try:
                 success = await update_saga_and_enqueue(
                     saga_id=saga_id,
                     status="SAGA_FAILED_INITIALIZATION",
-                    details={"error": str(e)},
+                    details={"error": error_msg},
                     routing_key=None,
                     payload=None,
                 )
                 if not success:
-                    logging.critical(f"[Saga] Failed to update {saga_id} with error: {str(e)}")
+                    logging.critical(f"[Saga] Failed to update {saga_id} with error: {error_msg}")
                     raise Exception("Saga update failed - will be sent to DLQ")
-            except Exception as e:
-                logging.exception(f"Saga initialization failed: {str(e)}", exc_info=True)
+            except Exception as nested_exception:
+                logging.exception(f"Saga initialization failed: {str(nested_exception)}", exc_info=True)
 
-        return {"error": str(e)}, 500
+        return {"error": error_msg}, 500
 
 
 @worker.register
@@ -751,6 +756,7 @@ async def process_stock_completed(data, message):
     try:
         logging.info(f"[Order Orchestrator] Processing stock completion: {data}")
         saga_id = data.get('saga_id')
+        logging.info(f"[Order Orchestrator] Processing stock completion for Saga ID: {saga_id}")
         if not saga_id and message:
             if hasattr(message, 'correlation_id') and message.correlation_id:
                 saga_id = message.correlation_id
