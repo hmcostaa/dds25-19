@@ -11,9 +11,18 @@ from redis.asyncio.sentinel import Sentinel
 from flask import Flask, jsonify, abort, Response
 from typing import Optional, Tuple, Any, Union, Tuple, Dict
 from redis.exceptions import WatchError, RedisError
+
 import random
 import time
 import logging
+import redis.exceptions
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+RETRYABLE_REDIS_EXCEPTIONS = (
+    redis.exceptions.ConnectionError,
+    redis.exceptions.TimeoutError,
+    redis.exceptions.BusyLoadingError
+)
 
 from global_idempotency.idempotency_decorator import idempotent
 
