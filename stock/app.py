@@ -10,7 +10,9 @@ from common.amqp_worker import AMQPWorker
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
 from flask import Flask, jsonify, abort, Response
 import redis.asyncio as redis
-from redis.asyncio.sentinel import Sentinel 
+from redis.asyncio.sentinel import Sentinel
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, RetryError
+import redis.exceptions 
 from redis.exceptions import WatchError, RedisError
 from global_idempotency.idempotency_decorator import idempotent
 
@@ -63,7 +65,11 @@ async def close_db_connection():
     await db_slave.close()
     await idempotency_redis_client.close()
 
-
+RETRYABLE_REDIS_EXCEPTIONS = (
+    redis.exceptions.ConnectionError,
+    redis.exceptions.TimeoutError,
+    redis.exceptions.BusyLoadingError
+)
 
 
 class StockValue(Struct):
@@ -93,6 +99,30 @@ async def get_item_from_db(item_id: str) -> Tuple[Union[StockValue, str], int]:
          logger.error(f"Unexpected error processing item {item_id}: {e}", exc_info=True)
          return {"error": "Unexpected processing error"}, 500
 
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=0.25, min=0.25, max=4),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
+async def call_atomic_update_with_retry(item_id: str, updater_func):
+    logger.debug(f"[_call_atomic_update_with_retry] Attempting atomic_update_item for {item_id}")
+    updated_item, error_msg = await atomic_update_item(item_id, updater_func)
+
+    if error_msg:
+        if "not found" in error_msg.lower() or "internal data format error" in error_msg.lower():
+            logger.warning(f"[_call_atomic_update_with_retry] Non-retryable: {error_msg}")
+            raise ValueError(error_msg)
+        else:
+            logger.error(f"[_call_atomic_update_with_retry] Raising retryable error for message: {error_msg}")
+            raise redis.exceptions.ConnectionError(f"Atomic update failed internally: {error_msg}")
+
+    if not updated_item:
+        logger.error("[_call_atomic_update_with_retry] Atomic update returned None, None unexpectedly.")
+        raise redis.exceptions.ConnectionError("Unknown atomic_update_item failure")
+
+    logger.debug(f"[_call_atomic_update_with_retry] Atomic update successful for {item_id}")
+    return updated_item
 
 async def atomic_update_item(item_id: str, update_func):
     max_retries = 5
@@ -208,7 +238,7 @@ async def find_item(data, message):
 async def add_stock(data, message):
     item_id = data.get("item_id")
     amount = data.get("amount")
-    idempotency_key = data.get("idempotency_key")
+    # idempotency_key = data.get("idempotency_key")
     if not all([item_id, amount is not None]):
         return {"error": "Missing required fields (item_id, amount)"}, 400
     
@@ -229,24 +259,15 @@ async def add_stock(data, message):
     error_msg = None
 
     try:
-        updated_item, error_msg = await atomic_update_item(item_id, updater)
+        updated_item = await call_atomic_update_with_retry(item_id, updater)
     
-        if error_msg:
-            logger.error(f"'add_stock' logic failed: {error_msg}")
-            logger.debug(f"error_msg: {error_msg}")
-            if "not found" in error_msg.lower(): 
-                status_code = 404
-            else: 
-                status_code = 500
-            return ({"added": False, "error": error_msg}, status_code)
-            
-        elif updated_item:
-            logger.info(f"Item: {item_id} stock updated to: {updated_item.stock}")
-            return ({"added": True, "stock": updated_item.stock}, 200)
+        logger.info(f"updated_item: {updated_item}")
+        return ({"added": True, "stock": updated_item.stock}, 200)
+    
+    except RetryError as e:
+        logger.error(f"[add_stock] Operation failed after multiple retries for item {item_id}: {e}")
+        return ({"added": False, "error": f"Service temporarily unavailable after retries: {getattr(e, 'cause', e)}"}, 503)
 
-        else:
-            #fallback
-            return ({"added": False, "error": "Internal processing error"}, 500)
         
     except ValueError as e:
         error_msg = str(e)
@@ -265,7 +286,6 @@ async def remove_stock(data, message):
     order_id = data.get("order_id")
     callback_action = data.get("callback_action")
 
-    # Debug log all incoming parameters
     debug_info = {
         "item_id": item_id,
         "amount": amount,
@@ -323,81 +343,62 @@ async def remove_stock(data, message):
         return item
 
     try:
-        updated_item, error_msg = await atomic_update_item(item_id, updater)
-        if error_msg:
-            error_response = {"error": f"Failed to update stock: {error_msg}"}
-            if saga_id:
-                error_response["saga_id"] = saga_id
-                error_response["order_id"] = order_id
-                error_response["callback_action"] = callback_action or "process_stock_completed"
-            if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
-                try:
-                    logger.info(f"[Stock] Sending error callback to {message.reply_to} for saga {saga_id}")
-                    error_response["callback_action"] = "process_stock_completed"
-                    await worker.send_message(
-                        payload=error_response,
-                        queue=message.reply_to,
-                        correlation_id=saga_id,
-                        action="process_stock_completed",
-                        callback_action="process_stock_completed",
-                        reply_to=None
-                    )
-                    logger.info(f"[Stock] Error callback sent successfully to {message.reply_to}")
-                except Exception as e:
-                    logger.error(f"[Stock] Failed to send error callback: {e}", exc_info=True)
+        updated_item = await call_atomic_update_with_retry(item_id, updater)
+        success_response = {
+            "removed": True,
+            "stock": updated_item.stock,
+            "saga_id": saga_id,
+            "order_id": order_id,
+            "callback_action": "process_stock_completed"  # Always include this
+        }
+        if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
+            logging.info(f"[Stock] Sending success callback to {message.reply_to} for saga {saga_id}")
+            try:
+                reply_to = message.reply_to
+                for attempt in range(3):
+                    logger.info(f"[Stock] Attempt #{attempt+1}")
+                    logger.info(f"[Stock] Sending success callback to {reply_to} for saga {saga_id}")
+                    logger.info(f"[Stock] Success response: {success_response}")
+                    logger.info(f"[Stock] Correlation ID: {saga_id}")
+                    try:
+                        await worker.send_message(
+                            payload=success_response,
+                            queue=reply_to,
+                            correlation_id=saga_id,
+                            action="process_stock_completed",
+                            callback_action="process_stock_completed",
+                            reply_to=None
+                        )
+                        logger.info(f"[Stock] Success callback sent to {reply_to} (attempt {attempt + 1})")
+                    except Exception as e:
+                        logger.error(f"[Stock] Error sending callback (attempt {attempt + 1}): {e}")
+                        await asyncio.sleep(0.1)
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.1)
+            except Exception as e:
+                logger.error(f"[Stock] Failed to send callback after all attempts: {e}", exc_info=True)
 
-            status_code = 400 if "not found" in error_msg.lower() else 500
-            logging.warning(f"[remove_stock:RETURN] Returning error4 tuple: ({error_response}, {status_code})")
-            return error_response, status_code
+        status_code = 200
+        logging.warning(f"[remove_stock:RETURN] Returning success1 tuple: ({success_response}, {status_code})")
+        return success_response, status_code
+     
 
-        if updated_item:
-            success_response = {
-                "removed": True,
-                "stock": updated_item.stock,
-                "saga_id": saga_id,
-                "order_id": order_id,
-                "callback_action": "process_stock_completed"  # Always include this
-            }
-            if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
-                logging.info(f"[Stock] Sending success callback to {message.reply_to} for saga {saga_id}")
-                try:
-                    reply_to = message.reply_to
-                    for attempt in range(3):
-                        logger.info(f"[Stock] Attempt #{attempt+1}")
-                        logger.info(f"[Stock] Sending success callback to {reply_to} for saga {saga_id}")
-                        logger.info(f"[Stock] Success response: {success_response}")
-                        logger.info(f"[Stock] Correlation ID: {saga_id}")
-                        try:
-                            await worker.send_message(
-                                payload=success_response,
-                                queue=reply_to,
-                                correlation_id=saga_id,
-                                action="process_stock_completed",
-                                callback_action="process_stock_completed",
-                                reply_to=None
-                            )
-                            logger.info(f"[Stock] Success callback sent to {reply_to} (attempt {attempt + 1})")
-                        except Exception as e:
-                            logger.error(f"[Stock] Error sending callback (attempt {attempt + 1}): {e}")
-                            await asyncio.sleep(0.1)
-                            if attempt == 2:
-                                raise
-                except Exception as e:
-                    logger.error(f"[Stock] Failed to send callback after all attempts: {e}", exc_info=True)
-
-            status_code = 200
-            logging.warning(f"[remove_stock:RETURN] Returning success1 tuple: ({success_response}, {status_code})")
-            return success_response, status_code
-        else:
-            error_response = {"error": "Failed to update item for unknown reason"}
-            if saga_id:
-                error_response["saga_id"] = saga_id
-                error_response["order_id"] = order_id
-                error_response["callback_action"] = "process_stock_completed"
-            status_code = 500
-            logging.warning(f"[remove_stock:RETURN] Returning error4 tuple: ({error_response}, {status_code})")
-            return error_response, status_code
-
+    except RetryError as e:
+        logger.error(f"[remove_stock] Operation failed after multiple retries for item {item_id}: {e}")
+        error_response = {"error": f"Service temporarily unavailable after retries: {getattr(e, 'cause', e)}"}
+        status_code = 503
+        if saga_id and message and hasattr(message, 'reply_to') and message.reply_to:
+             error_response["saga_id"] = saga_id
+             error_response["order_id"] = order_id
+             error_response["callback_action"] = callback_action or "process_stock_completed"
+             try:
+                  logger.info(f"[Stock] Sending final failure (RetryError) callback to {message.reply_to}")
+                  await worker.send_message(payload=error_response, queue=message.reply_to, correlation_id=saga_id, action="process_stock_completed", callback_action="process_stock_completed", reply_to=None)
+             except Exception as cb_e:
+                  logger.error(f"[Stock] Failed to send final failure callback: {cb_e}")
+        return error_response, status_code
+    
     except ValueError as e:
 
         error_message = str(e)
