@@ -72,12 +72,13 @@ sentinel_async = Sentinel([
 
 async def initialize_redis():
     global db_master, db_slave,db_master_saga,db_slave_saga
-    sentinel_async = Sentinel(
-        [('redis-sentinel-1', 26379), ('redis-sentinel-2', 26379), ('redis-sentinel-3', 26379)],
-        socket_timeout=10,
-        decode_responses=False,
-        password="redis",
-    )
+    global sentinel_async
+    # sentinel_async = Sentinel(
+    #     [('redis-sentinel-1', 26379), ('redis-sentinel-2', 26379), ('redis-sentinel-3', 26379)],
+    #     socket_timeout=10,
+    #     decode_responses=False,
+    #     password="redis",
+    # )
     db_master = await wait_for_master(sentinel_async, 'order-master')
     db_slave = sentinel_async.slave_for('order-master', decode_responses=False)
     db_master_saga = await wait_for_master(sentinel_async,'saga-master')

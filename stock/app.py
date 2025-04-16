@@ -43,7 +43,7 @@ sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
     (os.environ['REDIS_SENTINEL_2'], 26379),
     (os.environ['REDIS_SENTINEL_3'], 26379)],
-    socket_timeout=2, # TODO check if this is the right value, potentially lower it
+    socket_timeout=10, # TODO check if this is the right value, potentially lower it
     socket_connect_timeout=10,
     socket_keepalive=True,
     password=os.environ['REDIS_PASSWORD'],
@@ -55,12 +55,13 @@ sentinel_async = Sentinel([
 # db_slave=sentinel_async.slave_for('stock-master',  decode_responses=False)
 async def initialize_redis():
     global db_master, db_slave
-    sentinel_async = Sentinel(
-        [('redis-sentinel-1', 26379), ('redis-sentinel-2', 26379), ('redis-sentinel-3', 26379)],
-        socket_timeout=0.1,
-        decode_responses=False,
-        password="redis",
-    )
+    # sentinel_async = Sentinel(
+    #     [('redis-sentinel-1', 26379), ('redis-sentinel-2', 26379), ('redis-sentinel-3', 26379)],
+    #     socket_timeout=0.1,
+    #     decode_responses=False,
+    #     password="redis",
+    # )
+    global sentinel_async
     db_master = await wait_for_master(sentinel_async, 'stock-master')
     db_slave = sentinel_async.slave_for('stock-master', decode_responses=False)
     logging.info("Connected to Redis Sentinel.")
