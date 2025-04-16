@@ -31,12 +31,19 @@ worker = AMQPWorker(
     amqp_url=os.environ["AMQP_URL"],
     queue_name="stock_queue",
 )
-
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(redis.exceptions.ConnectionError),
+    reraise=True
+)
+async def wait_for_master(sentinel, service_name):
+    return sentinel.master_for(service_name, decode_responses=False)
 sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
     (os.environ['REDIS_SENTINEL_2'], 26379),
     (os.environ['REDIS_SENTINEL_3'], 26379)],
-    socket_timeout=15, # TODO check if this is the right value, potentially lower it
+    socket_timeout=2, # TODO check if this is the right value, potentially lower it
     socket_connect_timeout=10,
     socket_keepalive=True,
     password=os.environ['REDIS_PASSWORD'],
@@ -44,8 +51,20 @@ sentinel_async = Sentinel([
     decode_responses=False
 )
 
-db_master=sentinel_async.master_for('stock-master',  decode_responses=False)
-db_slave=sentinel_async.slave_for('stock-master',  decode_responses=False)
+# db_master=sentinel_async.master_for('stock-master',  decode_responses=False)
+# db_slave=sentinel_async.slave_for('stock-master',  decode_responses=False)
+async def initialize_redis():
+    global db_master, db_slave
+    sentinel_async = Sentinel(
+        [('redis-sentinel-1', 26379), ('redis-sentinel-2', 26379), ('redis-sentinel-3', 26379)],
+        socket_timeout=0.1,
+        decode_responses=False,
+        password="redis",
+    )
+    db_master = await wait_for_master(sentinel_async, 'stock-master')
+    db_slave = sentinel_async.slave_for('stock-master', decode_responses=False)
+    logging.info("Connected to Redis Sentinel.")
+
 
 #changed.. now saga master is used for idempotency as centralized client
 # Read connection details from environment variables
@@ -285,7 +304,6 @@ async def remove_stock(data, message):
     saga_id = data.get("saga_id")
     order_id = data.get("order_id")
     callback_action = data.get("callback_action")
-
     debug_info = {
         "item_id": item_id,
         "amount": amount,
@@ -439,6 +457,7 @@ async def remove_stock(data, message):
         return error_response, status_code 
 async def main():
     try:
+        await initialize_redis()
         await worker.start()
     finally:
         await close_db_connection()
