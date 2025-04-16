@@ -48,10 +48,12 @@ sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
     (os.environ['REDIS_SENTINEL_2'], 26379),
     (os.environ['REDIS_SENTINEL_3'], 26379)], #TODO 26379 for evey sentinel now
-    socket_timeout=10, #TODO check if it can be lowered
-    socket_connect_timeout=5,
+    socket_timeout=15,  # TODO check if this is the right value, potentially lower it
+    socket_connect_timeout=10,
     socket_keepalive=True,
-    password=os.environ['REDIS_PASSWORD']
+    password=os.environ['REDIS_PASSWORD'],
+    retry_on_timeout=True,
+    decode_responses=False
 )
 
 
