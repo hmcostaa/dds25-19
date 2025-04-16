@@ -204,7 +204,6 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
             order_data = saga_data.get("details", {})
             user_id = order_data.get("user_id")
             logging.debug(f"[ORCHESTRATOR] Order data: user_id={user_id}, order_details={order_data}")
-            
             # Verify payment
             payment_verified = False
             for attempt in range(5):
@@ -229,11 +228,35 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
 
             if payment_verified:
                 logging.debug(f"[ORCHESTRATOR] Returning success payload={result_payload}, status_code={status_code}")
+                await enqueue_outbox_message("handle_commit", {
+                    "saga_id": saga_id,
+                    "order_id": order_data.get("order_id")
+                })
                 return result_payload, status_code
             else:
                 logging.error(f"[ORCHESTRATOR] Payment verification failed after 5 attempts for saga {saga_id}")
                 return {"error": "Payment processing incomplete"}, 400
+
         else:
+            logging.error(f"[ORCHESTRATOR] Saga {saga_id} failed, triggering failure event.")
+
+            order_data = saga_data.get("details", {})
+            order_id = order_data.get("order_id", "unknown_order")
+
+            failure_payload = {
+                "saga_id": saga_id,
+                "order_id": order_id,
+                "error": saga_result.get("error", "Unknown saga failure")
+            }
+
+            # Publish failure event for process_failure_events
+            await enqueue_outbox_message("process_failure_events", failure_payload)
+            await enqueue_outbox_message("handle_rollback", {
+                "saga_id": saga_id,
+                "order_id": order_id,
+                "error": saga_result.get("error", "Unknown saga failure")
+            })
+
             return {"error": saga_result.get("error", "Unknown saga failure")}, 400
     except asyncio.TimeoutError:
         logging.warning(f"[Order Orchestrator] Timed out waiting for saga {saga_id}")
@@ -246,12 +269,25 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
         if latest_saga_data:
             latest_status = latest_saga_data.get("status")
             logging.info(f"Latest saga state for saga {saga_id}: {latest_status}")
-            
+
             if latest_status in ["SAGA_FAILED", "SAGA_FAILED_INITIALIZATION", "SAGA_FAILED_ORDER_NOT_FOUND",
                                  "SAGA_FAILED_RECOVERY", "ORDER_FINALIZATION_FAILED", "STOCK_RESERVATION_FAILED"]:
                 error_details = latest_saga_data.get("details", {}).get("error", "Unknown saga failure")
-                logging.error(f"[ORCHESTRATOR] Saga {saga_id} has failed with error: {error_details}")
-                
+                logging.error(f"[ORCHESTRATOR] Saga {saga_id} failed due to timeout/error: {error_details}")
+
+                failure_payload = {
+                    "saga_id": saga_id,
+                    "order_id": order_id if order_id else "unknown_order",
+                    "error": error_details
+                }
+
+                # Publish failure event for process_failure_events
+                await enqueue_outbox_message("process_failure_events", failure_payload)
+                await enqueue_outbox_message("saga.rollback", {
+                    "saga_id": saga_id,
+                    "order_id": order_id,
+                    "error": error_details
+                })
                 response = {"error": error_details}
                 if order_id:
                     response["order_id"] = order_id
@@ -453,7 +489,7 @@ async def connect_rpc_client():
 
 
 @worker.register
-@idempotent('create_order', idempotency_redis_client, SERVICE_NAME)
+@idempotent('create_order', idempotency_redis_client, SERVICE_NAME,False)
 async def create_order(data, message):
    
     # user_id = data.get("user_id")
@@ -501,7 +537,7 @@ async def find_order(data, message):
 
 
 @worker.register
-@idempotent('process_checkout_request', idempotency_redis_client, SERVICE_NAME)
+@idempotent('process_checkout_request', idempotency_redis_client, SERVICE_NAME,False)
 async def process_checkout_request(data, message):
     try:
         order_id = data.get('order_id')
@@ -641,7 +677,7 @@ async def process_checkout_request(data, message):
 
 
 @worker.register
-@idempotent('process_stock_completed', idempotency_redis_client, SERVICE_NAME)
+@idempotent('process_stock_completed', idempotency_redis_client, SERVICE_NAME,False )
 @register_original('process_stock_completed')
 async def process_stock_completed(data, message):
     logging.info(f"[STOCK COMPLETED] Data received: {data}, message: {message}")
@@ -781,7 +817,7 @@ async def process_stock_completed(data, message):
 
 
 @worker.register
-@idempotent('process_payment_completed', idempotency_redis_client, SERVICE_NAME)
+@idempotent('process_payment_completed', idempotency_redis_client, SERVICE_NAME,False)
 @register_original('process_payment_completed')
 async def process_payment_completed(data, message):
     try:
@@ -968,12 +1004,9 @@ async def process_payment_completed(data, message):
 
         return {"error": f"Failed to process payment completion: {str(e)}"}, 500
 
-@idempotent('process_failure_events', idempotency_redis_client, SERVICE_NAME)
+@worker.register
+@idempotent('process_failure_events', idempotency_redis_client, SERVICE_NAME,False)
 async def process_failure_events(data, message):
-    """
-    Any service can publish a failure event: e.g. 'stock.reservation_failed' or 'payment.failed'.
-    The orchestrator listens, updates the saga state, and triggers compensation if needed.
-    """
 
     #TODO refactor for saga update and enqueue
     try:
@@ -1092,12 +1125,20 @@ async def process_failure_events(data, message):
 #         return {"error": "Request error"}, 400
 #     else:
 #         return response
+@worker.register
+async def handle_commit(data, message):
+    logging.info(f"[SAGA COMMIT] Saga {data['saga_id']} committed successfully for order {data.get('order_id')}.")
+
+@worker.register
+async def handle_rollback(data, message):
+    logging.warning(f"[SAGA ROLLBACK] Saga {data['saga_id']} rolled back for order {data.get('order_id')}. Error: {data.get('error')}")
+
 
 
 #TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
 
 @worker.register
-@idempotent("add_item",idempotency_redis_client,SERVICE_NAME)
+@idempotent("add_item",idempotency_redis_client,SERVICE_NAME,False)
 async def add_item(data, message):
     order_id = data.get("order_id")
     item_id = data.get("item_id")
@@ -1177,8 +1218,8 @@ async def add_item(data, message):
     #update and save order
 #made async TODO
 async def atomic_update_order(order_id, update_func):
-    max_retries = 5
-    base_backoff = 50
+    max_retries = 10
+    base_backoff = 0.1
     for attempt in range(max_retries):
         try:
             async with db_master.pipeline(transaction=True) as pipe:

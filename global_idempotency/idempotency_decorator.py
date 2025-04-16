@@ -64,7 +64,7 @@ def create_hash(payload: dict, exclude_keys: set = None) -> str:
     
     return hash_value
 
-def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str):
+def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str,cache_errors: bool = False):
     logger.info(f"[IDEMPOTENCY] Setting up idempotent decorator for service={service_name}, operation={operation_name}")
     
     def decorator(func):
@@ -191,41 +191,46 @@ def idempotent(operation_name: str, redis_client: redis.Redis, service_name: str
                         
                         result_tuple = ({"error": str(e)}, status_code)
                         logger.debug(f"[IDEMPOTENCY:{func_name}] Created error result: {result_tuple}")
-                
-                    try:
-                        logger.debug(f"[IDEMPOTENCY:{func_name}] Encoding result tuple for storage")
-                        bytes_data = msgpack.encode(result_tuple)
-                        
-                        logger.debug(f"[IDEMPOTENCY:{func_name}] Storing result in Redis with TTL={IDEMPOTENT_KEY_TTL}s")
-                        bytes_were_set = await redis_client.set(redis_key, bytes_data, nx=True, ex=IDEMPOTENT_KEY_TTL)
-                        
-                        if bytes_were_set:
-                            logger.info(f"[IDEMPOTENCY:{func_name}] Successfully stored result in Redis for key: {redis_key}")
-                            logger.info(f"Stored idempotency result for key {redis_key}")  
-                        else:
-                            await asyncio.sleep(0.05)
-                            
-                            retry_bytes = await redis_client.get(redis_key)
-                            if retry_bytes:
-                                try:
-                                    result_tuple = msgpack.decode(retry_bytes)
-                                    
-                                except (MsgspecDecodeError, TypeError) as e:
-                                    logger.error(f"[IDEMPOTENCY:{func_name}] Error decoding retry result: {str(e)}")
-                                    logger.warning("Falling back to original redis key: {redis_key}")  
+
+                    # Only cache successful results or when explicitly allowed
+                    # Only cache successful results or when explicitly allowed
+                    if cache_errors or (200 <= result_tuple[1] < 300):
+                        try:
+                            logger.debug(f"[IDEMPOTENCY:{func_name}] Encoding result tuple for storage")
+                            bytes_data = msgpack.encode(result_tuple)
+
+                            logger.debug(
+                                f"[IDEMPOTENCY:{func_name}] Storing result in Redis with TTL={IDEMPOTENT_KEY_TTL}s")
+                            bytes_were_set = await redis_client.set(redis_key, bytes_data, nx=True,
+                                                                    ex=IDEMPOTENT_KEY_TTL)
+
+                            if bytes_were_set:
+                                logger.info(
+                                    f"[IDEMPOTENCY:{func_name}] Successfully stored result in Redis for key: {redis_key}")
                             else:
-                                logger.warning(f"[IDEMPOTENCY:{func_name}] Retry GET failed, key not found")
-                                logger.debug(f"refetch failed for key {redis_key}")  
-                    except (MsgspecEncodeError, TypeError, ValueError) as e:
-                        logger.error(f"error encoding result tuple for key {redis_key}: {e}")
-                        return {"error": "Idempotency error"}, 500
-                    except redis.exceptions.RedisError as e:
-                        logger.error(f"Redis error storing result tuple for key {redis_key}: {e}")  
-                        return {"error": "Idempotency store error"}, 503
-                    
+                                await asyncio.sleep(0.05)
+                                retry_bytes = await redis_client.get(redis_key)
+                                if retry_bytes:
+                                    try:
+                                        result_tuple = msgpack.decode(retry_bytes)
+                                    except (MsgspecDecodeError, TypeError) as e:
+                                        logger.error(f"[IDEMPOTENCY:{func_name}] Error decoding retry result: {str(e)}")
+                                else:
+                                    logger.warning(f"[IDEMPOTENCY:{func_name}] Retry GET failed, key not found")
+
+                        except (MsgspecEncodeError, TypeError, ValueError) as e:
+                            logger.error(f"Error encoding result tuple for key {redis_key}: {e}")
+                            return {"error": "Idempotency encoding error"}, 500
+                        except redis.RedisError as e:
+                            logger.error(f"Redis error storing result tuple for key {redis_key}: {e}")
+                            return {"error": "Idempotency store error"}, 503
+                    else:
+                        logger.info(
+                            f"[IDEMPOTENCY:{func_name}] Skipped caching error response due to cache_errors=False. Status code: {result_tuple[1]}")
+
                     return result_tuple
-            
-            except redis.exceptions.RedisError as e:
+
+            except redis.RedisError as e:
                 logger.error(f"[IDEMPOTENCY:{func_name}] Redis error accessing cache: {str(e)}", exc_info=True)
                 return {"error": "Idempotency error"}, 503
             except Exception as e:

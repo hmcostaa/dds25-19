@@ -15,6 +15,7 @@ import random
 import time
 import logging
 
+
 from global_idempotency.idempotency_decorator import idempotent
 
 from msgspec import msgpack, Struct, DecodeError as MsgspecDecodeError, EncodeError as MsgspecEncodeError
@@ -75,11 +76,6 @@ async def close_db_connection():
     await idempotency_redis_client.close()
 
 
-
-
-
-
-
 class UserValue(Struct):
     credit: int
 
@@ -104,8 +100,8 @@ async def get_user_from_db(user_id: str) -> Tuple[Union[UserValue, Dict], int]:
 async def atomic_update_user(user_id: str, update_func):
     #retry? backoff/?
     #for attempts i tn range(max_retries): 
-    max_retries = 5
-    base_backoff = 50 
+    max_retries = 10
+    base_backoff = 0.1
 
     # async with db.pipeline(transaction=True) as pipe: # async pipeline, should probably be used TODO
     for attempt in range(max_retries):
@@ -184,7 +180,7 @@ def require_user_id(data):
     return str(uid).strip()
 
 @worker.register
-@idempotent('create_user', idempotency_redis_client, SERVICE_NAME) #not sure if idempotent or not TODO
+@idempotent('create_user', idempotency_redis_client, SERVICE_NAME,False) #not sure if idempotent or not TODO
 async def create_user(data, message):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
@@ -228,7 +224,7 @@ async def find_user(data, message):
         return {"error": f"Error retrieving user from DB for id {user_id}: {e}"}, 500
     
 @worker.register
-@idempotent('add_funds', idempotency_redis_client, SERVICE_NAME)
+@idempotent('add_funds', idempotency_redis_client, SERVICE_NAME,False)
 async def add_funds(data, message) -> IdempotencyResultTuple:
     user_id =  require_user_id(data)
     amount = int(data.get("amount", 0))
@@ -253,7 +249,7 @@ async def add_funds(data, message) -> IdempotencyResultTuple:
         return {"error": "Failed to update user, unknown reason"}, 500
     
 @worker.register
-@idempotent('pay', idempotency_redis_client, SERVICE_NAME)
+@idempotent('pay', idempotency_redis_client, SERVICE_NAME,False)
 async def pay(data, message) -> IdempotencyResultTuple:
     user_id = data.get("user_id")
     amount = data.get("amount")
@@ -304,7 +300,7 @@ async def pay(data, message) -> IdempotencyResultTuple:
         return response_tuple 
 
 @worker.register
-@idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME)
+@idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME,False)
 async def remove_credit(data, message)-> IdempotencyResultTuple:
     """
     Remove credit from a user's account as part of a payment process.
@@ -453,7 +449,7 @@ async def remove_credit(data, message)-> IdempotencyResultTuple:
         return (error_data, 500)
 
 @worker.register
-@idempotent('compensate', idempotency_redis_client, SERVICE_NAME)
+@idempotent('compensate', idempotency_redis_client, SERVICE_NAME,False)
 async def compensate(data, message):
     try:
         user_id = data.get("user_id")
