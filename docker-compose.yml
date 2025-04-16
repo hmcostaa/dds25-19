@@ -4,6 +4,8 @@ networks:
   redis-cluster-network:
     driver: bridge
 
+
+
 services:
   rabbitmq:
     image: rabbitmq:3-management-alpine
@@ -191,7 +193,11 @@ services:
     ports:
       - "6380:6379"
     networks:
-      - redis-cluster-network
+       redis-cluster-network:
+         aliases:
+           - redis-stock-master
+           - stock-master.local
+
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
