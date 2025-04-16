@@ -75,7 +75,7 @@ async def get_item_from_db(item_id: str) -> Tuple[Union[StockValue, str], int]:
     logger.info(f"--- STOCK: get_item_from_db - Getting item_id={item_id} from DB ---")
     try:
         entry: bytes = await db_slave.get(item_id)
-    except redis.exceptions.RedisError:
+    except redis.RedisError:
         return DB_ERROR_STR, 400
     logger.info(f"--- STOCK: get_item_from_db - Decoded entry type={type(entry)}, value='{str(entry)[:100]}...' ---")
     # deserialize data if it exists else return null
@@ -168,7 +168,7 @@ async def create_item(data, message):
         await db_master.set(key, value)
         return {'item_id': key, 'stock': item.stock, 'price': item.price}, 201
     
-    except redis.exceptions.RedisError as re:
+    except redis.RedisError as re:
         return {'error': f"Redis Error: {re}"}, 500
     except Exception as e:
         return {'error': f"Unexpected error: {str(e)}"}, 500
@@ -184,7 +184,7 @@ async def batch_init_stock(data, message):
     }
     try:
         await db_master.mset(kv_pairs)
-    except redis.exceptions.RedisError as re:
+    except redis.RedisError as re:
         return {'error': str(re)}, 500
     except Exception as e:
         return {'error': f"Unexpected error: {str(e)}"}, 500
