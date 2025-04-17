@@ -12,3 +12,4 @@ pytest-asyncio
 pytest-mock==3.14.0
 quart
 tenacity
+aiohttp
