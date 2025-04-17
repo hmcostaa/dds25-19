@@ -8,15 +8,16 @@ import logging
 app = Quart(__name__)
 rpc_client = RpcClient()
 
-
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
 
 @app.before_serving
 async def startup():
     await rpc_client.connect(os.environ["AMQP_URL"])
 
-#other handle rpc response since messages werent propagated succesfully through the gateway (not coherent with test)
+
+# other handle rpc response since messages werent propagated succesfully through the gateway (not coherent with test)
 async def handle_rpc_response(rpc_result):
     if isinstance(rpc_result, dict):
         if "status_code" in rpc_result and isinstance(rpc_result["status_code"], int):
@@ -28,8 +29,8 @@ async def handle_rpc_response(rpc_result):
                 # need to keep the error message in the response body for the client
                 response_data = {"error": rpc_result["error"]}
             else:
-                 response_data = {"error": "Worker response missing data/error field"}
-                 status_code = 500
+                response_data = {"error": "Worker response missing data/error field"}
+                status_code = 500
 
             logger.info(f"Gateway received structured response: Status={status_code}, Data/Error={response_data}")
             return jsonify(response_data), status_code
@@ -40,6 +41,7 @@ async def handle_rpc_response(rpc_result):
         logger.error(f"Gateway received unexpected response format: {type(rpc_result)} - {rpc_result}")
         return jsonify({"error": "Internal Server Error - Invalid response format from worker"}), 500
 
+
 # payload key
 def ensure_idempotency_key() -> str:
     idempotency_key = request.headers.get("Idempotency-Key")
@@ -49,6 +51,7 @@ def ensure_idempotency_key() -> str:
     else:
         logger.debug(f"Using provided Idempotency-Key: {idempotency_key}")
     return idempotency_key
+
 
 ######## Order Service Routes ########
 
@@ -63,15 +66,17 @@ async def create_order(user_id):
     result = await rpc_client.call("order_queue", "create_order", payload)
     return await handle_rpc_response(result)
 
+
 @app.route("/orders/find/<order_id>")
 async def find_order(order_id):
     payload = {
         "order_id": order_id
     }
-    result = await rpc_client.call("order_queue","find_order",payload )
+    result = await rpc_client.call("order_queue", "find_order", payload)
     return await handle_rpc_response(result)
 
-@app.route("/orders/addItem/<order_id>/<item_id>/<quantity>", methods=["POST"]) 
+
+@app.route("/orders/addItem/<order_id>/<item_id>/<quantity>", methods=["POST"])
 async def add_item(order_id, item_id, quantity):
     idempotency_key = ensure_idempotency_key()
     payload = {
@@ -80,8 +85,9 @@ async def add_item(order_id, item_id, quantity):
         "quantity": int(quantity),
         "idempotency_key": idempotency_key
     }
-    result = await rpc_client.call("order_queue","add_item",payload )
+    result = await rpc_client.call("order_queue", "add_item", payload)
     return await handle_rpc_response(result)
+
 
 @app.route("/orders/checkout/<order_id>", methods=["POST"])
 async def checkout_order(order_id):
@@ -92,9 +98,9 @@ async def checkout_order(order_id):
     }
     logger.info(f"Gateway: Sending checkout RPC for order {order_id}")
     result = await rpc_client.call("order_queue", "process_checkout_request", payload)
-    logger.info(f"Gateway: Received RPC result for order {order_id}: {result}") 
+    logger.info(f"Gateway: Received RPC result for order {order_id}: {result}")
     response_tuple = await handle_rpc_response(result)
-    logger.info(f"Gateway: Sending HTTP response for order {order_id}: {response_tuple}") 
+    logger.info(f"Gateway: Sending HTTP response for order {order_id}: {response_tuple}")
     return response_tuple
 
 
@@ -104,9 +110,10 @@ async def checkout_order(order_id):
 async def create_item(price):
     idempotency_key = ensure_idempotency_key()
     payload = {"price": int(price), "idempotency_key": idempotency_key}
-    
+
     result = await rpc_client.call(queue="stock_queue", action="create_item", payload=payload)
     return await handle_rpc_response(result)
+
 
 @app.route("/stock/find/<item_id>", methods=["GET"])
 async def find_item(item_id):
@@ -114,7 +121,8 @@ async def find_item(item_id):
     payload = {"item_id": item_id}
     result = await rpc_client.call(queue="stock_queue", action="find_item", payload=payload)
     return await handle_rpc_response(result)
-    
+
+
 @app.route("/stock/add/<item_id>/<amount>", methods=["POST"])
 async def add_stock_item(item_id, amount):
     idempotency_key = ensure_idempotency_key()
@@ -124,9 +132,10 @@ async def add_stock_item(item_id, amount):
         "idempotency_key": idempotency_key
     }
     result = await rpc_client.call(queue="stock_queue",
-                                           action="add_stock",
-                                           payload=payload)
+                                   action="add_stock",
+                                   payload=payload)
     return await handle_rpc_response(result)
+
 
 @app.route("/stock/subtract/<item_id>/<amount>", methods=["POST"])
 async def subtract_stock(item_id, amount):
@@ -139,17 +148,19 @@ async def subtract_stock(item_id, amount):
     result = await rpc_client.call(queue="stock_queue", action="remove_stock", payload=payload)
     return await handle_rpc_response(result)
 
+
 @app.route("/stock/batch_init/<n>/<starting_stock>/<item_price>", methods=["POST"])
-async def batch_init(n,starting_stock,item_price):
+async def batch_init(n, starting_stock, item_price):
     payload = {
         "n": n,
-        "starting_stock" : starting_stock,
-        "item_price" : item_price
+        "starting_stock": starting_stock,
+        "item_price": item_price
     }
     result = await rpc_client.call(queue="stock_queue",
-                                           action="batch_init_stock",
-                                           payload=payload)
+                                   action="batch_init_stock",
+                                   payload=payload)
     return await handle_rpc_response(result)
+
 
 ######## Payment Service Routes ########
 
@@ -169,7 +180,7 @@ async def add_credit_to_user(user_id, amount):
 
 
 @app.route("/payment/pay/<user_id>/<amount>", methods=["POST"])
-async def payment_pay(user_id, amount): 
+async def payment_pay(user_id, amount):
     idempotency_key = ensure_idempotency_key()
     payload = {
         "user_id": user_id,
@@ -179,28 +190,31 @@ async def payment_pay(user_id, amount):
     result = await rpc_client.call(queue="payment_queue", action="pay", payload=payload)
     return await handle_rpc_response(result)
 
+
 @app.route(("/payment/create_user"), methods=["POST"])
 async def create_user():
     idempotency_key = ensure_idempotency_key()
     result = await rpc_client.call(queue="payment_queue",
-                                    action="create_user",
-                                    payload={"idempotency_key": idempotency_key}
-                                    )
+                                   action="create_user",
+                                   payload={"idempotency_key": idempotency_key}
+                                   )
     return await handle_rpc_response(result)
+
 
 @app.route("/payment/find_user/<user_id>", methods=["GET"])
 async def find_user(user_id):
     result = await rpc_client.call(queue="payment_queue",
-                                           action="find_user",
-                                           payload={"user_id": user_id})
+                                   action="find_user",
+                                   payload={"user_id": user_id})
     return await handle_rpc_response(result)
+
 
 @app.route("/payment/batch_init/<num_users>/<start_credit>", methods=["POST"])
 async def payment_batch_init(num_users, start_credit):
     try:
         payload = {
-            "n": int(num_users), 
-            "starting_money": int(start_credit) 
+            "n": int(num_users),
+            "starting_money": int(start_credit)
         }
         logger.debug(f"Gateway: Calling payment_queue RPC action 'batch_init_users' with payload: {payload}")
 
@@ -212,11 +226,13 @@ async def payment_batch_init(num_users, start_credit):
         return await handle_rpc_response(result)
 
     except ValueError:
-        logger.error(f"Gateway: Invalid non-integer parameters received: num_users='{num_users}', start_credit='{start_credit}'")
+        logger.error(
+            f"Gateway: Invalid non-integer parameters received: num_users='{num_users}', start_credit='{start_credit}'")
         return {"error": "Invalid parameters: num_users and start_credit must be integers."}, 400
     except Exception as e:
         logger.exception(f"Gateway: Error processing /payment/batch_init: {e}")
         return {"error": "Internal Server Error during batch initialization"}, 500
+
 
 # @app.route("/stock/batch/<n>/<starting_stock>/<item_price>", methods=["POST"])
 # async def batch_init(n, starting_stock, item_price):
@@ -245,10 +261,10 @@ async def payment_batch_init(num_users, start_credit):
 #     except Exception as e:
 #         logger.exception(f"Gateway: Unhandled exception in /stock/batch/ handler: {e}")
 #         return {"error": "Internal Server Error during stock batch initialization"}, 500
-    
+
 @app.route("/orders/batch_init/<num_orders>/<num_items>/<num_users>/<item_price>", methods=["POST"])
 async def order_batch_init(num_orders, num_items, num_users, item_price):
-    try:    
+    try:
         payload = {
             "n_orders": int(num_orders),
             "n_items": int(num_items),
@@ -258,7 +274,7 @@ async def order_batch_init(num_orders, num_items, num_users, item_price):
         logger.debug(f"Gateway: Calling order_queue RPC action 'batch_init_orders' with payload: {payload}")
 
         result = await rpc_client.call(queue="order_queue",
-                                       action="batch_init_orders", 
+                                       action="batch_init_orders",
                                        payload=payload)
 
         logger.debug(f"Gateway: Received RPC result for batch_init_orders: {result}")
@@ -271,9 +287,11 @@ async def order_batch_init(num_orders, num_items, num_users, item_price):
         logger.exception(f"Gateway: Error processing /orders/batch_init: {e}")
         return {"error": "Internal Server Error during order batch initialization"}, 500
 
+
 @app.route("/health")
 def health():
     return "OK", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

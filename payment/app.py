@@ -21,7 +21,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 RETRYABLE_REDIS_EXCEPTIONS = (
     redis.exceptions.ConnectionError,
     redis.exceptions.TimeoutError,
-    redis.exceptions.BusyLoadingError
+    redis.exceptions.BusyLoadingError,
+    redis.exceptions.ReadOnlyError,
+    redis.exceptions.WatchError
 )
 
 from global_idempotency.idempotency_decorator import idempotent
@@ -48,15 +50,82 @@ worker = AMQPWorker(
 )
 
 DB_ERROR_STR = "DB error"
-
+db_master_payment_cached = None
+db_slave_payment_cached=None
+_active_redis_clients=set()
 @retry(
     stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def wait_for_master(sentinel, service_name):
-    return sentinel.master_for(service_name, decode_responses=False)
+    client = sentinel.master_for(service_name, decode_responses=False)
+    await asyncio.wait_for(client.ping(), timeout=8.0)
+    _active_redis_clients.add(client)
+    return client
+async def close_all_redis_clients():
+    global _active_redis_clients
+    for client in _active_redis_clients:
+        try:
+            await client.aclose()
+        except Exception as e:
+            logging.warning(f"Failed to close Redis client: {e}")
+    _active_redis_clients.clear()
+async def wait_for_slave(sentinel, service_name):
+    try:
+        client = sentinel.slave_for(service_name, decode_responses=False)
+        await asyncio.wait_for(client.ping(), timeout=5.0)
+        _active_redis_clients.add(client)
+        return client
+    except Exception as e:
+        logging.error(f"Failed to connect to slave for {service_name}: {str(e)}")
+        await handle_redis_connection_failure(e)
+        raise
+async def get_db_master_payment():
+    global db_master_payment_cached
+    try:
+        if db_master_payment_cached is not None:
+            try:
+                await asyncio.wait_for(db_master_payment_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Payment master connection unhealthy - resetting")
+                db_master_payment_cached = None
+        if db_master_payment_cached is None:
+            db_master_payment_cached = await wait_for_master(sentinel_async, 'payment-master')
+            await db_master_payment_cached.ping()
+        return db_master_payment_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting master: {e}")
+        db_master_payment_cached = None
+        await handle_redis_connection_failure(e)
+        raise
+async def get_db_slave_payment():
+    global db_slave_payment_cached
+    try:
+        if db_slave_payment_cached is not None:
+            try:
+                await asyncio.wait_for(db_slave_payment_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Payment master connection unhealthy - resetting")
+                db_slave_payment_cached = None
+        if db_slave_payment_cached is None:
+            db_slave_payment_cached = await wait_for_slave(sentinel_async, 'payment-master')
+            await db_slave_payment_cached.ping()
+        return db_slave_payment_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting master: {e}")
+        db_slave_payment_cached = None
+        await handle_redis_connection_failure(e)
+        raise
+
+
+async def handle_redis_connection_failure(e):
+    global db_master_payment_cached,db_slave_payment_cached
+    logging.warning(f"Redis connection failure detected: {str(e)} - Resetting connections")
+    db_master_payment_cached = None
+    db_slave_payment_cached=None
+
 sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
     (os.environ['REDIS_SENTINEL_2'], 26379),
@@ -90,36 +159,76 @@ async def initialize_redis():
 # changed.. now saga master is used for idempotency as centralized client
 # Read connection details from environment variables
 
-idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0)) 
-idempotency_redis_client = sentinel_async.master_for(
-    "saga-master",
-    decode_responses=False,
-    db=idempotency_redis_db
-)
-
-logging.info("Connected to idempotency (Payment) Redis.")
+# idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+# idempotency_redis_client = sentinel_async.master_for(
+#     "saga-master",
+#     decode_responses=False,
+#     db=idempotency_redis_db
+# )
+#
+# logging.info("Connected to idempotency (Payment) Redis.")
 
 
 async def close_db_connection():
     await db_master.close()
     await db_slave.close()
-    await idempotency_redis_client.close()
+    await close_all_redis_clients()
+    # await idempotency_redis_client.close()
 
 
 class UserValue(Struct):
     credit: int
 
+async def warmup_redis_connections():
+    for _ in range(3):  # Create a small pool of ready connections
+        try:
+            client = await wait_for_master(sentinel_async, 'payment-master')
+            await client.ping()
+        except Exception as e:
+            logging.warning(f"Connection warmup error (non-fatal): {e}")
+    logging.info("Redis connection pool pre-warmed")
+_idempotency_redis_client = None
 
 @retry(
-    stop=stop_after_attempt(5),
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=0.2, min=0.2, max=2),
+    retry=retry_if_exception_type(redis.exceptions.RedisError),
+    reraise=True
+)
+def get_idempotency_redis_client():
+    global _idempotency_redis_client
+    if _idempotency_redis_client is None:
+        _idempotency_redis_client = sentinel_async.master_for(
+            "saga-master",
+            decode_responses=False,
+            db=int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+        )
+    return _idempotency_redis_client
+
+async def close_idempotency_redis_client():
+    global _idempotency_redis_client
+    client = _idempotency_redis_client
+    if client:
+        try:
+            if hasattr(client, "close"):
+                await client.close()
+                logging.info("Closed idempotency Redis client")
+        except Exception as e:
+            logging.warning(f"Error closing Redis client: {e}")
+        _idempotency_redis_client = None
+
+@retry(
+    stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def get_user_from_db(user_id: str) -> Tuple[Union[UserValue, Dict], int]:
     print(f"--- PAYMENT: get_user_from_db: ENTERED for user_id={user_id}")
     try:
-        entry: Optional[bytes] = await db_slave.get(user_id)
+        client = await get_db_slave_payment()
+        entry = await client.get(user_id)
+        # entry: Optional[bytes] = await db_slave.get(user_id)
     except redis.exceptions.RedisError as redis_err:
         logging.error(f"Redis GET ERROR: {redis_err}")
         return {"error": DB_ERROR_STR}, 500
@@ -136,9 +245,9 @@ async def get_user_from_db(user_id: str) -> Tuple[Union[UserValue, Dict], int]:
 
 
 @retry(
-    stop=stop_after_attempt(5),
+    stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def atomic_update_user(user_id: str, update_func):
@@ -151,7 +260,9 @@ async def atomic_update_user(user_id: str, update_func):
 
     # pipe = db_master.pipeline(transaction=True)
     try:
-        async with db_master.pipeline(transaction=True) as pipe:
+        client= await get_db_master_payment()
+        # db_master = await wait_for_master(sentinel_async, 'payment-master')
+        async with client.pipeline(transaction=True) as pipe:
             # idempotency check?
             # if ?
             # max retry attempts
@@ -203,6 +314,7 @@ async def atomic_update_user(user_id: str, update_func):
         logging.warning(f"WatchError: key was modified between watch and execute, retry backoff")
         # backoff_multiplier = (2 ** attempt) * (1 + random.random() * 0.1)
         # backoff = base_backoff * backoff_multiplier
+        raise e
 
         # await asyncio.sleep(backoff / 1000)
     except redis.RedisError:
@@ -225,18 +337,19 @@ def require_user_id(data):
 
 
 @retry(
-    stop=stop_after_attempt(5),
+    stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 @worker.register
-@idempotent('create_user', idempotency_redis_client, SERVICE_NAME, False)  # not sure if idempotent or not TODO
+@idempotent('create_user', get_idempotency_redis_client(), SERVICE_NAME, False)  # not sure if idempotent or not TODO
 async def create_user(data, message):
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
-        await db_master.set(key, value)
+        client= await get_db_master_payment()
+        await client.set(key, value)
         return {'user_id': key}, 200
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
@@ -252,12 +365,18 @@ async def batch_init_users(data, message):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        await db_master.mset(kv_pairs)
+        client= await get_db_master_payment()
+        await client.mset(kv_pairs)
     except redis.exceptions.RedisError:
         return {"error": DB_ERROR_STR}, 400
     return {"msg": "Batch init for users successful"}, 200
 
-
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 @worker.register
 async def find_user(data, message):
     try:
@@ -270,13 +389,21 @@ async def find_user(data, message):
         response = {"user_id": user_id, "credit": user_entry2.credit}
         logging.debug(f"Found user {user_id} with credit {user_entry2.credit}")
         return response, 200
+    except redis.RedisError as e:
+        logging.error(f"Redis error in find_user: {e}")
+        return {"error": "Database temporarily unavailable"}, 500
     except Exception as e:
         logging.exception("Error retrieving user from DB for id %s: %s", user_id, e)
         return {"error": f"Error retrieving user from DB for id {user_id}: {e}"}, 500
 
-
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 @worker.register
-@idempotent('add_funds', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('add_funds', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def add_funds(data, message) -> IdempotencyResultTuple:
     user_id = require_user_id(data)
     amount = int(data.get("amount", 0))
@@ -299,9 +426,14 @@ async def add_funds(data, message) -> IdempotencyResultTuple:
     else:
         return {"error": "Failed to update user, unknown reason"}, 500
 
-
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 @worker.register
-@idempotent('pay', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('pay', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def pay(data, message) -> IdempotencyResultTuple:
     user_id = data.get("user_id")
     amount = data.get("amount")
@@ -354,13 +486,13 @@ async def pay(data, message) -> IdempotencyResultTuple:
 
 
 @retry(
-    stop=stop_after_attempt(5),
+    stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 @worker.register
-@idempotent('remove_credit', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('remove_credit', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def remove_credit(data, message) -> IdempotencyResultTuple:
     logging.info(f"[PAYMENT] Starting remove_credit operation")
 
@@ -490,7 +622,8 @@ async def remove_credit(data, message) -> IdempotencyResultTuple:
             "credit": updated_user.credit,
             "saga_id": saga_id,
             "order_id": order_id,
-            "callback_action": callback_action or "process_payment_completed"
+            "callback_action": callback_action or "process_payment_completed",
+            "success": True
         }
         logging.info(f"[PAYMENT] Operation completed successfully for user_id={user_id}, saga_id={saga_id}")
         return (success_data, 200)
@@ -509,7 +642,7 @@ async def remove_credit(data, message) -> IdempotencyResultTuple:
 
 
 @worker.register
-@idempotent('compensate', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('compensate', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def compensate(data, message):
     try:
         user_id = data.get("user_id")
@@ -566,12 +699,17 @@ async def compensate(data, message):
         logging.exception("Error canceling payment for user %s: %s", user_id, e)
         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
 
-
+@worker.register
+async def health_check(data, message):
+    return {"status": "ok"}, 200
 async def main():
     try:
+        await warmup_redis_connections()
         await initialize_redis()
         await worker.start()
+        await close_all_redis_clients()
     finally:
+        await close_idempotency_redis_client()
         await close_db_connection()
 
 

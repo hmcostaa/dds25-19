@@ -7,6 +7,8 @@ import random
 import uuid
 import asyncio
 import time
+import weakref
+
 import redis.exceptions as redis_exceptions
 import logging as logging_module
 from aiohttp import web
@@ -33,29 +35,155 @@ from global_idempotency.idempotency_decorator import idempotent
 
 warnings.filterwarnings("ignore", message=".*Python 2.7.*")
 
+warnings.filterwarnings(
+    "ignore",
+    message="unclosed <redis.asyncio.connection.Connection",
+    category=ResourceWarning
+)
+
+
 SERVICE_NAME = "order"
 
 # TODO create config file for this
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 SAGA_STATE_TTL = 864000 * 3
-LOCK_TIMEOUT = 30000
+LOCK_TIMEOUT = 10000
 
 logging.basicConfig(level=logging.INFO)
 logging = logging.getLogger("order-service")
 
-app = Flask("order-service")
+RETRYABLE_REDIS_EXCEPTIONS = (
+    redis.exceptions.ConnectionError,
+    redis.exceptions.TimeoutError,
+    redis.exceptions.BusyLoadingError,
+    redis.exceptions.ReadOnlyError,
+    redis.exceptions.WatchError,
+   redis.exceptions.ReadOnlyError,
+    redis.exceptions.AuthenticationError,
+    redis.exceptions.ResponseError,
+)
 
+app = Flask("order-service")
+_active_redis_clients = set()
 @retry(
     stop=stop_after_attempt(10),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def wait_for_master(sentinel, service_name):
-    client = sentinel.master_for(service_name, decode_responses=False)
-    await client.ping()
-    return client
+    try:
+        client = sentinel.master_for(service_name, decode_responses=False)
+        await asyncio.wait_for(client.ping(), timeout=8.0)
+        _active_redis_clients.add(client)
+        return client
+    except Exception as e:
+        logging.error(f"Failed to connect to master for {service_name}: {str(e)}")
+        await handle_redis_connection_failure(e)
+        raise
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
+async def wait_for_slave(sentinel, service_name):
+    try:
+        client = sentinel.slave_for(service_name, decode_responses=False)
+        await asyncio.wait_for(client.ping(), timeout=5.0)
+        _active_redis_clients.add(client)
+        return client
+    except Exception as e:
+        logging.error(f"Failed to connect to slave for {service_name}: {str(e)}")
+        await handle_redis_connection_failure(e)
+        raise
+
+db_master_saga_cached = None
+db_master_order_cached = None
+db_slave_order_cached=None
+db_slave_saga_cached=None
+async def handle_redis_connection_failure(e):
+    global db_master_saga_cached, db_master_order_cached, db_slave_saga_cached,db_slave_order_cached
+    logging.warning(f"Redis connection failure detected: {str(e)} - Resetting connections")
+    db_master_saga_cached = None
+    db_master_order_cached = None
+    db_slave_order_cached = None
+    db_slave_saga_cached = None
+
+async def get_db_master_saga():
+    global db_master_saga_cached
+    try:
+        if db_master_saga_cached is not None:
+            try:
+                await asyncio.wait_for(db_master_saga_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Saga master connection unhealthy - resetting")
+                db_master_saga_cached = None
+        if db_master_saga_cached is None:
+            db_master_saga_cached = await wait_for_master(sentinel_async, 'saga-master')
+            await db_master_saga_cached.ping()
+        return db_master_saga_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting master: {e}")
+        db_master_saga_cached=None
+        await handle_redis_connection_failure(e)
+        raise
+
+async def get_db_master_order():
+    global db_master_order_cached
+    try:
+        if db_master_order_cached is not None:
+            try:
+                await asyncio.wait_for(db_master_order_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Order master connection unhealthy - resetting")
+                db_master_order_cached = None
+        if db_master_order_cached is None:
+            db_master_order_cached = await wait_for_master(sentinel_async, 'order-master')
+            await db_master_order_cached.ping()
+        return db_master_order_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting master: {e}")
+        db_master_order_cached = None
+        await handle_redis_connection_failure(e)
+        raise
+async def get_db_slave_order():
+    global db_slave_order_cached
+    try:
+        if db_slave_order_cached is not None:
+            try:
+                await asyncio.wait_for(db_slave_order_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Order master connection unhealthy - resetting")
+                db_slave_order_cached = None
+        if db_slave_order_cached is None:
+            db_slave_order_cached = await wait_for_slave(sentinel_async, 'order-master')
+            await db_slave_order_cached.ping()
+        return db_slave_order_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting master: {e}")
+        db_slave_order_cached = None
+        await handle_redis_connection_failure(e)
+        raise
+async def get_db_slave_saga():
+    global db_slave_saga_cached
+    try:
+        if db_slave_saga_cached is not None:
+            try:
+                await asyncio.wait_for(db_slave_saga_cached.ping(), timeout=2.0)
+            except (redis.RedisError, asyncio.TimeoutError):
+                logging.warning("Order master connection unhealthy - resetting")
+                db_slave_saga_cached = None
+        if db_slave_saga_cached is None:
+            db_slave_saga_cached = await wait_for_slave(sentinel_async, 'saga-master')
+            await db_slave_saga_cached.ping()
+        return db_slave_saga_cached
+    except redis.RedisError as e:
+        logging.error(f"Redis error getting slave: {e}")
+        db_slave_saga_cached = None
+        await handle_redis_connection_failure(e)
+        raise
 
 sentinel_async = Sentinel([
     (os.environ['REDIS_SENTINEL_1'], 26379),
@@ -69,7 +197,12 @@ sentinel_async = Sentinel([
     decode_responses=False
 )
 
-
+@retry(
+    wait=wait_exponential(multiplier=0.1, min=0.1, max=2),
+    stop=stop_after_attempt(10),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 async def initialize_redis():
     global db_master, db_slave,db_master_saga,db_slave_saga
     global sentinel_async
@@ -90,12 +223,76 @@ async def initialize_redis():
 # changed.. now saga master is used for idempotency as centralized client
 # Read connection details from environment variables
 
-idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
-idempotency_redis_client = sentinel_async.master_for(
-    "saga-master",
-    decode_responses=False,
-    db=idempotency_redis_db
+# idempotency_redis_db = int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+# idempotency_redis_client = sentinel_async.master_for(
+#     "saga-master",
+#     decode_responses=False,
+#     db=idempotency_redis_db
+# )
+# Add at module level
+redis_circuit_open = False
+last_failure_time = 0
+
+
+async def redis_circuit_breaker(func):
+    async def wrapper(*args, **kwargs):
+        global redis_circuit_open, last_failure_time
+        current_time = time.time()
+
+        if redis_circuit_open and current_time - last_failure_time > 10:
+            redis_circuit_open = False  # Reset after 10 seconds
+
+        if redis_circuit_open:
+            raise redis.RedisError("Circuit breaker open")
+
+        try:
+            return await func(*args, **kwargs)
+        except redis.RedisError as e:
+            last_failure_time = current_time
+            redis_circuit_open = True
+            raise
+
+    return wrapper
+async def warmup_redis_connections():
+    for _ in range(3):  # Create a small pool of ready connections
+        try:
+            client = await wait_for_master(sentinel_async, 'saga-master')
+            await client.ping()
+            client = await wait_for_master(sentinel_async, 'order-master')
+            await client.ping()
+        except Exception as e:
+            logging.warning(f"Connection warmup error (non-fatal): {e}")
+    logging.info("Redis connection pool pre-warmed")
+_idempotency_redis_client = None
+
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_exponential(multiplier=0.2, min=0.2, max=2),
+    retry=retry_if_exception_type(redis.exceptions.RedisError),
+    reraise=True
 )
+def get_idempotency_redis_client():
+    global _idempotency_redis_client
+    if _idempotency_redis_client is None:
+        _idempotency_redis_client = sentinel_async.master_for(
+            "saga-master",
+            decode_responses=False,
+            db=int(os.environ.get('IDEMPOTENCY_REDIS_DB', 0))
+        )
+    return _idempotency_redis_client
+
+async def close_idempotency_redis_client():
+    global _idempotency_redis_client
+    client = _idempotency_redis_client
+    if client:
+        try:
+            if hasattr(client, "close"):
+                await client.close()
+                logging.info("Closed idempotency Redis client")
+        except Exception as e:
+            logging.warning(f"Error closing Redis client: {e}")
+        _idempotency_redis_client = None
+
 
 SERVICE_ID = str(uuid.uuid4())
 ORCHESTRATOR_ID = str(uuid.uuid4())
@@ -139,16 +336,17 @@ def register_original(name=None):
 
     return decorator
 
-@retry(wait=wait_fixed(0.2), stop=stop_after_attempt(5), retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)))
+@retry(wait=wait_fixed(0.2), stop=stop_after_attempt(5), retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS))
 async def safe_get_message(pubsub):
     return await pubsub.get_message(ignore_subscribe_messages=True, timeout=0.5)
 
 
 async def start_pubsub_listener(saga_id: str) -> asyncio.Task:
     notification_channel = f"saga_completion:{saga_id}"
-    pubsub = db_master_saga.pubsub()
-    pubsub_clients[saga_id] = pubsub
 
+    client_saga= await get_db_master_saga()
+    pubsub = client_saga.pubsub()
+    pubsub_clients[saga_id] = pubsub
     async def listen_for_completion():
         try:
             await pubsub.subscribe(notification_channel)
@@ -156,8 +354,27 @@ async def start_pubsub_listener(saga_id: str) -> asyncio.Task:
             while not saga_futures[saga_id].done():
                 try:
                     message = await safe_get_message(pubsub)
-                    if message and message['type'] == 'message':
-                        data = json.loads(message['data']) if isinstance(message['data'], str) else message['data']
+                    if message:
+                        # Check message is a dict before trying to access keys
+                        if not isinstance(message, dict):
+                            logging.warning(f"[PubSub] Received non-dict message type: {type(message)}")
+                            await asyncio.sleep(0.1)
+                            continue
+
+                        if message.get('type') == 'message':
+                            message_data = message.get('data')
+                            if isinstance(message_data, bytes):
+                                try:
+                                    data = json.loads(message_data.decode('utf-8'))
+                                except (UnicodeDecodeError, json.JSONDecodeError):
+                                    data = message_data
+                            elif isinstance(message_data, str):
+                                try:
+                                    data = json.loads(message_data)
+                                except json.JSONDecodeError:
+                                    data = message_data
+                            else:
+                                data = message_data
                         logging.info(f"[PubSub] Received notification for saga {saga_id}: {data}")
                         completion_data = json.loads(data) if isinstance(data, str) else data
                         if saga_id in saga_futures and not saga_futures[saga_id].done():
@@ -231,17 +448,14 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
     saga_futures[saga_id] = asyncio.Future()
     await start_pubsub_listener(saga_id)
     try:
-        await asyncio.wait_for(saga_futures[saga_id], timeout=20)
+        await asyncio.wait_for(saga_futures[saga_id], timeout=30)
         saga_result = saga_futures[saga_id].result()
         logging.info(f"[Order Orchestrator] Saga {saga_id} completed with result: {saga_result}")
 
         if saga_result.get("success", False):
-
-            # Extract order data
             order_data = saga_data.get("details", {})
             user_id = order_data.get("user_id")
             logging.debug(f"[ORCHESTRATOR] Order data: user_id={user_id}, order_details={order_data}")
-            # Verify payment
             payment_verified = False
             for attempt in range(5):
 
@@ -363,7 +577,12 @@ async def handle_final_saga_state(saga_id, request_idempotency_key, final_status
         if saga_id in listener_tasks and not listener_tasks[saga_id].done():
             listener_tasks[saga_id].cancel()
 
-
+@retry(
+    wait=wait_exponential(multiplier=0.1, min=0.1, max=2),
+    stop=stop_after_attempt(10),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 async def enqueue_outbox_message(routing_key: str, payload: dict):
     message = {
         "routing_key": routing_key,
@@ -371,7 +590,8 @@ async def enqueue_outbox_message(routing_key: str, payload: dict):
         "timestamp": time.time()
     }
     try:
-        await db_master_saga.rpush(OUTBOX_KEY, json.dumps(message))
+        client_saga= await get_db_master_saga()
+        await client_saga.rpush(OUTBOX_KEY, json.dumps(message))
         logging.info(f"[Order Orchestrator] Enqueued message to outbox: {message}")
     except Exception as e:
         logging.error(f"Error while enqueueing message to outbox: {str(e)}", exc_info=True)
@@ -379,8 +599,8 @@ async def enqueue_outbox_message(routing_key: str, payload: dict):
 
 @retry(
     wait=wait_exponential(multiplier=0.1, min=0.1, max=2),
-    stop=stop_after_attempt(5),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    stop=stop_after_attempt(10),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def update_saga_and_enqueue(saga_id, status, routing_key: str | None, payload: dict | None, details=None,
@@ -389,7 +609,8 @@ async def update_saga_and_enqueue(saga_id, status, routing_key: str | None, payl
     saga_key = f"saga:{saga_id}"
     notification_channel = f"saga_completion:{saga_id}"
     try:
-        async with db_master_saga.pipeline(transaction=True) as pipe:
+        client_saga = await get_db_master_saga()
+        async with client_saga.pipeline(transaction=True) as pipe:
             await pipe.watch(saga_key)
             saga_json = await pipe.get(saga_key)
             if saga_json:
@@ -456,18 +677,16 @@ async def update_saga_and_enqueue(saga_id, status, routing_key: str | None, payl
     except Exception as e:
         logging.error(f"Error updating saga state {saga_id} to {status}: {str(e)}", exc_info=True)
 
-    logging.critical("f[SAGA UPDATE] Failed after {max_attempts} attempts for {saga_id}.")
-    return False
-
+    logging.critical(f"[SAGA UPDATE] Failed after {max_attempts} attempts for {saga_id}.")
+    raise redis.exceptions.WatchError(f"Failed to update saga {saga_id} after retries")
 
 async def close_db_connection():
     await db_master.close()
     await db_slave.close()
     await db_master_saga.close()
     await db_slave_saga.close()
+    await close_all_redis_clients()
     await cleanup_pubsub_resource()
-    await idempotency_redis_client.close()
-
 
 class OrderValue(Struct):
     paid: bool
@@ -478,14 +697,15 @@ class OrderValue(Struct):
 @retry(
     wait=wait_exponential(multiplier=0.05, max=1),
     stop=stop_after_attempt(3),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def get_order_from_db(order_id: str) -> Tuple[Union[OrderValue, Dict], int]:
     try:
         # get serialized data
         # entry = await db_slave.get(order_id)
-        entry: bytes | None = await db_master.get(order_id)  # temporary for testing TODO for change
+        client = await get_db_slave_order()
+        entry = await client.get(order_id)  # temporary for testing TODO for change
         if not entry:
             logging.warning(f"Order: {order_id} not found in the database")
             return {"error": f"Order: {order_id} not found!"}, 404
@@ -527,7 +747,8 @@ async def batch_init_orders(data: dict, message):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
                                   for i in range(n)}
     try:
-        await db_master.mset(kv_pairs)
+        client=await get_db_master_order()
+        await client.mset(kv_pairs)
     except redis.RedisError:
         return {"error": DB_ERROR_STR}, 400
     return {"msg": "Batch init for orders successful"}, 200
@@ -535,13 +756,14 @@ async def batch_init_orders(data: dict, message):
 @retry(
     wait=wait_exponential(multiplier=0.05, max=1),
     stop=stop_after_attempt(3),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def get_saga_state(saga_id: str) -> str:
     try:
         saga_key = f"saga:{saga_id}"
-        saga_json = await asyncio.wait_for(db_slave_saga.get(saga_key),timeout=5.0)
+        client=await get_db_slave_saga()
+        saga_json = await asyncio.wait_for(client.get(saga_key),timeout=5.0)
         if saga_json:
             if isinstance(saga_json, bytes):
                 saga_json = saga_json.decode('utf-8')
@@ -561,9 +783,14 @@ async def connect_rpc_client():
     # Connect the RpcClient to the AMQP server
     await rpc_client.connect(os.environ["AMQP_URL"])
 
-
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 @worker.register
-@idempotent('create_order', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('create_order', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def create_order(data, message):
     # user_id = data.get("user_id")
     # in some cases data was the entire message
@@ -576,13 +803,14 @@ async def create_order(data, message):
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         print(f"--- ORDER SVC: create_order - Attempting to set order {key} for user {user_id}", flush=True)
-        await db_master.set(key, value)
+        client=await get_db_master_order()
+        await client.set(key, value)
 
         await update_saga_and_enqueue(saga_id=key, status="INITIATED", routing_key=None, payload=None)
         return {"order_id": key}, 200
 
 
-    except redis.RedisError:
+    except redis.RedisError as e:
         logging.error(f"Redis error creating order {key} for user {user_id}: {e}")
         return {"error": "Redis error"}, 500
     except Exception as e:
@@ -608,7 +836,7 @@ async def find_order(data, message):
 
 
 @worker.register
-@idempotent('process_checkout_request', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('process_checkout_request', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def process_checkout_request(data, message):
     try:
         order_id = data.get('order_id')
@@ -633,7 +861,7 @@ async def process_checkout_request(data, message):
             return {"error": f"No items found in order {order_id}"}, 400
         for item_id, amount in items_to_be_reserved:
             try:
-                stock_check_payload = {"item_id": item_id}
+                stock_check_payload = {"item_id": item_id,"timestamp": time.time()}
                 stock_response = await rpc_client.call(queue="stock_queue", action="find_item",
                                                        payload=stock_check_payload)
                 logging.info(f"[STOCK RESPONSE] Found stock response: {stock_response}")
@@ -748,7 +976,7 @@ async def process_checkout_request(data, message):
 
 
 @worker.register
-@idempotent('process_stock_completed', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('process_stock_completed', get_idempotency_redis_client(), SERVICE_NAME, False)
 @register_original('process_stock_completed')
 async def process_stock_completed(data, message):
     logging.info(f"[STOCK COMPLETED] Data received: {data}, message: {message}")
@@ -785,7 +1013,8 @@ async def process_stock_completed(data, message):
 
             try:
                 completion_channel = f"saga_completion:{saga_id}"
-                await db_master_saga.publish(completion_channel, json.dumps({"success": False, "error": error_msg}))
+                client_saga = await get_db_master_saga()
+                await client_saga.publish(completion_channel, json.dumps({"success": False, "error": error_msg}))
                 logging.info(f"[Order Orchestrator] Published stock failure notification for saga {saga_id}")
             except Exception as e:
                 logging.error(f"[Order Orchestrator] Failed to publish stock failure notification: {str(e)}")
@@ -879,7 +1108,8 @@ async def process_stock_completed(data, message):
                     payload={"saga_id": saga_id, "order_id": order_id}
                 )
                 completion_channel = f"saga_completion:{saga_id}"
-                await db_master_saga.publish(completion_channel, json.dumps({"success": False, "error": str(e)}))
+                client_saga = await get_db_master_saga()
+                await client_saga.publish(completion_channel, json.dumps({"success": False, "error": str(e)}))
 
             except Exception as inner_e:
                 logging.error(f"[Order Orchestrator] Error updating saga state: {str(inner_e)}")
@@ -888,7 +1118,7 @@ async def process_stock_completed(data, message):
 
 
 @worker.register
-@idempotent('process_payment_completed', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('process_payment_completed', get_idempotency_redis_client(), SERVICE_NAME, False)
 @register_original('process_payment_completed')
 async def process_payment_completed(data, message):
     try:
@@ -917,7 +1147,8 @@ async def process_payment_completed(data, message):
         )
         try:
             completion_channel = f"saga_completion:{saga_id}"
-            await db_master_saga.publish(completion_channel, json.dumps({"success": True}))
+            client_saga = await get_db_master_saga()
+            await client_saga.publish(completion_channel, json.dumps({"success": True}))
             logging.info(f"[Order Orchestrator] Published payment completion notification for saga {saga_id}")
         except Exception as e:
             logging.error(f"[Order Orchestrator] Failed to publish payment completion notification: {str(e)}")
@@ -1005,7 +1236,8 @@ async def process_payment_completed(data, message):
 
             completion_channel = f"saga_completion:{saga_id}"
             try:
-                await db_master_saga.publish(completion_channel, json.dumps({"success": True}))
+                client_saga = await get_db_master_saga()
+                await client_saga.publish(completion_channel, json.dumps({"success": True}))
                 logging.info(f"[Order Orchestrator] Published completion notification for saga {saga_id}")
             except Exception as e:
                 logging.error(f"[Order Orchestrator] Failed to publish completion: {str(e)}")
@@ -1025,7 +1257,8 @@ async def process_payment_completed(data, message):
         )
         try:
             completion_channel = f"saga_completion:{saga_id}"
-            await db_master_saga.publish(completion_channel, json.dumps({"success": True}))
+            client_saga = await get_db_master_saga()
+            await client_saga.publish(completion_channel, json.dumps({"success": True}))
             logging.info(f"[Order Orchestrator] Published final completion notification for saga {saga_id}")
         except Exception as e:
             logging.error(f"[Order Orchestrator] Failed to publish final completion notification: {str(e)}")
@@ -1069,7 +1302,8 @@ async def process_payment_completed(data, message):
                             "error": f"Failed during order finalization: {str(e)}"
                         })
                     completion_channel = f"saga_completion:{saga_id}"
-                    await db_master_saga.publish(completion_channel, json.dumps({"success": False, "error": str(e)}))
+                    client_saga = await get_db_master_saga()
+                    await client_saga.publish(completion_channel, json.dumps({"success": False, "error": str(e)}))
             except Exception as inner_e:
                 logging.error(f"[Order Orchestrator] Error during failure handling: {str(inner_e)}", exc_info=True)
 
@@ -1077,7 +1311,7 @@ async def process_payment_completed(data, message):
 
 
 @worker.register
-@idempotent('process_failure_events', idempotency_redis_client, SERVICE_NAME, False)
+@idempotent('process_failure_events', get_idempotency_redis_client(), SERVICE_NAME, False)
 async def process_failure_events(data, message):
     # TODO refactor for saga update and enqueue
     try:
@@ -1222,7 +1456,7 @@ async def handle_rollback(data, message):
 # TODO should be made atomic, easily done through @idempotent when we merge with stock/payment idempotent branch
 
 @worker.register
-@idempotent("add_item", idempotency_redis_client, SERVICE_NAME, False)
+@idempotent("add_item", get_idempotency_redis_client(), SERVICE_NAME, False)
 async def add_item(data, message):
     order_id = data.get("order_id")
     item_id = data.get("item_id")
@@ -1306,7 +1540,7 @@ async def add_item(data, message):
 @retry(
     wait=wait_exponential(multiplier=0.1, min=0.05, max=2),
     stop=stop_after_attempt(5),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
 async def atomic_update_order(order_id, update_func):
@@ -1314,7 +1548,8 @@ async def atomic_update_order(order_id, update_func):
     base_backoff = 0.1
     for attempt in range(max_retries):
         try:
-            async with db_master.pipeline(transaction=True) as pipe:
+            client = await get_db_master_order()
+            async with client.pipeline(transaction=True) as pipe:
                 await pipe.watch(order_id)
                 entry = await pipe.get(order_id)
                 if not entry:
@@ -1362,31 +1597,36 @@ async def atomic_update_order(order_id, update_func):
 
 
 # Helper methods locks
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 async def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
-    """
-    Acquire a write lock on an order to prevent multiple writes.
-    :param order_id: The ID of the order to lock.
-    :param lock_timeout: The lock timeout in milliseconds (default: 10 seconds).
-    :return: True if the lock was acquired, False otherwise.
-    """
+    client=await get_db_master_order()
     lock_key = f"write_lock:order:{order_id}"
     lock_value = str(uuid.uuid4())  # Unique value to identify the lock owner
     try:
         # Try to acquire the lock using Redis SET with NX and PX options
-        is_locked = await db_master.set(lock_key, lock_value, nx=True, px=lock_timeout)
+        is_locked = await client.set(lock_key, lock_value, nx=True, px=lock_timeout)
+        if not is_locked:
+            return None
         if is_locked:
             logging.info(f"Lock acquired for order: {order_id}")
-            await db_master.hset(
-                f"lock_meta:{lock_key}", mapping={
+            await client.hset(
+                f"lock_meta:{lock_key}",
+                mapping={
                     "service_id": SERVICE_ID,
                     "ttl": SAGA_STATE_TTL,
                     "lock_timeout": lock_timeout,
-                    "lock_value": lock_value
+                    "lock_value": lock_value,
+                    "acquired_at": time.time()
                 }
             )
 
             # TODO, check if correct? lock timeout wasnt impelemented??
-            await db_master.expire(f"lock_meta:{lock_key}", int(lock_timeout / 1000) + 10)
+            # await db_master.expire(f"lock_meta:{lock_key}", int(lock_timeout / 1000) + 10)
             return lock_value
 
         else:
@@ -1397,37 +1637,75 @@ async def acquire_write_lock(order_id: str, lock_timeout: int = 10000) -> str:
         return None
 
 
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
+    reraise=True
+)
 async def release_write_lock(order_id: str, lock_value: str) -> bool:
     lock_key = f"write_lock:order:{order_id}"
     meta_key = f"lock_meta:{lock_key}"
-    try:
+    logging.info(f"[LOCK]Releasing lock for order: {order_id}")
 
-        # Use a Lua script to ensure atomicity
+    client = await get_db_master_order()
+    try:
+        # Check if lock exists first
+        actual = await client.get(lock_key)
+
+        # Lock is already gone - consider this a success
+        if actual is None:
+            logging.info(f"[LOCK] Lock for order {order_id} already released")
+            return True
+
+        # Use Lua script for atomic check-and-delete
         lua_script = """
-        if redis.call("GET", KEYS[1]) == ARGV[1] then
-           redis.call("DEL", KEYS[1])
-           redis.call("DEL", KEYS[2])
-           return 1
-        else
-          return 0
-        end
-        """
-        result = await db_master.eval(lua_script, 2, lock_key, meta_key, lock_value)
-        # i think this should be 2 instead of 1, my lue experience is limited
-        # TODO check
+            if redis.call("get", KEYS[1]) == ARGV[1] then
+               return redis.call("del", KEYS[1])
+            else
+               return 0
+            end
+            """
+
+        result = await client.eval(lua_script, 1, lock_key, lock_value)
+
         if result == 1:
-            logging.info(f"Lock released for order: {order_id}")
+            logging.info(f"[LOCK] Released lock for order {order_id}")
             return True
         else:
-            current_lock_value = await db_master.get(lock_key)
-            if current_lock_value == lock_value:
-                logging.warning(f"still has a value for lock {lock_key} ")
-            else:
-                logging.warning(f"Failed to release lock for order {order_id}-lock value mismatch")
-            return False  # Returns True if the lock was released, False otherwise
+            actual_decoded = actual.decode("utf-8") if isinstance(actual, bytes) else actual
+            logging.warning(
+                f"[LOCK] Lock value mismatch for {order_id}. Expected: {lock_value}, Found: {actual_decoded}")
+            return False
     except Exception as e:
-        logging.error(f"Error while releasing lock for order: {order_id}: {str(e)}")
+        logging.error(f"[LOCK] Error releasing lock for {order_id}: {e}")
         return False
+    #     db_master= await get_db_master_order()
+    #     result = await db_master.eval(lua_script, 2, lock_key, meta_key, lock_value)
+    #     logging.info(f"[LOCk]Releasing lock for order: {order_id} result: {result}")
+    #     # i think this should be 2 instead of 1, my lue experience is limited
+    #     # TODO check
+    #     if result == 1:
+    #         logging.info(f"Lock released for order: {order_id}")
+    #         return True
+    #     else:
+    #         db_master = await get_db_master_order()
+    #         current_lock_value = await db_master.get(lock_key)
+    #         logging.info(f"Lock released for order: {order_id}: {current_lock_value}")
+    #         logging.info(f"[LOCK]Lock value for order: {order_id}: {lock_value}")
+    #         if current_lock_value == lock_value:
+    #             logging.warning(f"still has a value for lock {lock_key} ")
+    #         else:
+    #             logging.warning(f"Failed to release lock for order {order_id}-lock value mismatch")
+    #         return False  # Returns True if the lock was released, False otherwise
+    #
+    # except redis.exceptions.RedisError as e:
+    #         logging.error(f"[Lock Release] Redis error releasing lock for {order_id}: {e}")
+    #         raise
+    #
+    # except Exception as e:
+    #     logging.error(f"[Lock Release] Unexpected error releasing lock for {order_id}: {e}")
+    #     return False
 
 
 # Forcibly release abandoned locks
@@ -1436,13 +1714,15 @@ async def force_release_locks(order_id: str) -> bool:
     lock_key = f"write_lock:order:{order_id}"
     meta_key = f"lock_meta:{lock_key}"
     try:
-        meta = await db_master.hgetall(meta_key)
+        client = await get_db_master_order()
+        meta = await client.hgetall(meta_key)
         if meta:
-            acquired_at = float(meta.get("acquired_at", 0))
+            acquired_at = float(meta.get("acquired_at", 0) or 0)
             timeout = int(meta.get("lock_timeout", LOCK_TIMEOUT))
-            if time.time() - (acquired_at + (timeout / 1000) * 2):
-                await db_master.delete(lock_key)
-                await db_master.delete(meta_key)
+            if time.time() > acquired_at + (timeout / 1000) * 2:
+                client = await get_db_master_order()
+                await client.delete(lock_key)
+                await client.delete(meta_key)
                 logging.warning(f"Force released lock for order: {order_id}")
                 return True
         return False
@@ -1453,7 +1733,7 @@ async def force_release_locks(order_id: str) -> bool:
 @retry(
     wait=wait_fixed(0.5),
     stop=stop_after_attempt(5),
-    retry=(retry_if_exception_type(redis.exceptions.RedisError) | retry_if_exception_type(redis.exceptions.TimeoutError)),
+    retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True,
     before=before_log(logging,logging_module.WARNING)
 )
@@ -1511,7 +1791,8 @@ async def maintain_leadership():
     while True:
         try:
             # Attempt to acquire leadership
-            is_leader = await db_master_saga.set(
+            client_saga = await get_db_master_saga()
+            is_leader = await client_saga.set(
                 "leader:order-orchestrator",
                 ORCHESTRATOR_ID,
                 nx=True,
@@ -1521,11 +1802,13 @@ async def maintain_leadership():
                 logging.info("[Order Orchestrator] Acquired leadership.")
             else:
                 # If already the leader, refresh the TTL
-                if await db_master_saga.get("leader:order-orchestrator") == ORCHESTRATOR_ID:
-                    await db_master_saga.expire("leader:order-orchestrator", 30)
+                client_saga = await get_db_master_saga()
+                if await client_saga.get("leader:order-orchestrator") == ORCHESTRATOR_ID:
+                    await client_saga.expire("leader:order-orchestrator", 30)
 
             # Heartbeat
-            await db_master_saga.setex(f"heartbeat:{ORCHESTRATOR_ID}", 30, "alive")
+            client_saga = await get_db_master_saga()
+            await client_saga.setex(f"heartbeat:{ORCHESTRATOR_ID}", 30, "alive")
             await asyncio.sleep(10)
         except Exception as e:
             logging.error(f"Leadership maintenance error: {str(e)}")
@@ -1538,10 +1821,12 @@ async def recover_in_progress_sagas():
     mark them as failed or attempt compensation.
     """
     try:
-        list_of_keys = await db_master_saga.keys("saga:*")
+        client_saga = await get_db_master_saga()
+        list_of_keys = await client_saga.keys("saga:*")
         print(f"--- ORDER SVC: recover_in_progress_sagas - List of keys: {list_of_keys}")
         for key in list_of_keys:
-            saga_json = await db_slave_saga.get(key)
+            client_saga=await get_db_slave_saga()
+            saga_json = await client_saga.get(key)
             if not saga_json:
                 continue
 
@@ -1619,17 +1904,18 @@ async def cleanup_stale_locks():
     while True:
         try:
             pattern = "write_lock:order:*"
-            lock_keys = await db_master.keys(pattern)
+            client=await get_db_master_order()
+            lock_keys = await client.keys(pattern)
 
             for lock_key in lock_keys:
                 meta_key = f"lock_meta:{lock_key}"
-                meta = await db_master.hgetall(meta_key)
+                meta = await client.hgetall(meta_key)
 
                 if meta and "lock_timeout" in meta:
                     lock_timeout = int(meta["lock_timeout"])
                     # If lock has been around too long, force release it
-                    await db_master.delete(lock_key)
-                    await db_master.delete(meta_key)
+                    await client.delete(lock_key)
+                    await client.delete(meta_key)
                     logging.warning(f"Cleaned up stale lock: {lock_key}")
 
             await asyncio.sleep(30)  # Check every 30 seconds
@@ -1639,27 +1925,30 @@ async def cleanup_stale_locks():
 
 
 async def periodic_lock_cleanup():
-    """Periodically scan for and clean up stale locks"""
     while True:
         try:
-
-            lock_keys = await db_master.keys("write_lock:order:*")
+            client=await get_db_master_order()
+            lock_keys = await client.keys("write_lock:order:*")
 
             for key in lock_keys:
+                key_str = key.decode('utf-8') if isinstance(key, bytes) else key
+                order_id = key_str.split(":")[-1]
+                meta_key = f"lock_meta:{key_str}"
+                meta = await client.hgetall(meta_key)
 
-                order_id = key.split(":")[-1]
+                if meta:
+                    acquired_raw = meta.get(b"acquired_at") or meta.get("acquired_at")
+                    timeout_raw = meta.get(b"lock_timeout") or meta.get("lock_timeout")
 
-                meta_key = f"lock_meta:{key}"
-                meta = await db_master.hgetall(meta_key)
-
-                if meta and "acquired_at" in meta:
-                    acquired_at = float(meta["acquired_at"])
-                    lock_timeout = int(meta.get("lock_timeout", LOCK_TIMEOUT))
-
-                    # If lock is older than 2x the timeout, force release it
-                    if time.time() - acquired_at > (lock_timeout / 1000) * 2:
-                        await force_release_locks(order_id)
-                        logging.warning(f"[Lock Cleanup] Released stale lock for order {order_id}")
+                    try:
+                        acquired_at = float(acquired_raw.decode() if isinstance(acquired_raw, bytes) else acquired_raw)
+                        lock_timeout = int(timeout_raw.decode() if isinstance(timeout_raw, bytes) else timeout_raw)
+                        # If lock is older than 2x the timeout, force release it
+                        if time.time() - acquired_at > (lock_timeout / 1000) * 2:
+                            await force_release_locks(order_id)
+                            logging.warning(f"[Lock Cleanup] Released stale lock for order {order_id}")
+                    except Exception as e:
+                        logging.warning(f"[Lock Cleanup] Skipped bad metadata for {order_id}: {e}")
 
             await asyncio.sleep(30)
         except Exception as e:
@@ -1687,7 +1976,6 @@ async def process_callback_messages(message):
                 body = message.body
                 if isinstance(body, bytes):
                     body = body.decode('utf-8')
-
                 if isinstance(body, str):
                     try:
                         data = json.loads(body)
@@ -1869,11 +2157,17 @@ async def outbox_poller():
             # blpop instead of loop
             # TODO what if message loss between LOP and succesfull AMQP publish???
             # Added brpoplush to prevent the issue
-            raw = await db_master_saga.brpoplpush(OUTBOX_KEY, f"{OUTBOX_KEY}:processing", timeout=5)
-            if not raw:
+            client_saga =await get_db_master_saga()
+            raw = await client_saga.brpoplpush(OUTBOX_KEY, f"{OUTBOX_KEY}:processing", timeout=5)
+            if raw is None:
                 await asyncio.sleep(1)
                 continue
-            message = json.loads(raw)
+            try:
+                message = json.loads(raw)
+            except Exception as e:
+                logging.error(f"[Outbox] Failed to decode message: {e}")
+                await client_saga.lrem(f"{OUTBOX_KEY}:processing", 0, raw)
+                continue
             routing_key = message.get("routing_key")
             payload = message.get("payload")
             if "idempotency_key" not in payload and message.get("idempotency_key"):
@@ -1883,14 +2177,16 @@ async def outbox_poller():
             if message.get("reply_to"):
                 payload["reply_to"] = message.get("reply_to")
             message_id = message.get("message_id", str(uuid.uuid4()))
-            success = raw = await safe_brpoplpush(db_master_saga, OUTBOX_KEY, f"{OUTBOX_KEY}:processing", timeout=5)
+            success = await publish_event(routing_key, payload, message_id)
             if success:
-                await db_master_saga.lrem(f"{OUTBOX_KEY}:processing", 0, raw)
+                client_saga = await get_db_master_saga()
+                await client_saga.lrem(f"{OUTBOX_KEY}:processing", 0, raw)
                 logging.info(f"[Outbox] Published event {routing_key} => {payload}")
             else:
                 await asyncio.sleep(0.5)
-                await db_master_saga.lrem(f"{OUTBOX_KEY}:processing", 0, raw)
-                await db_master_saga.lpush(OUTBOX_KEY, raw)
+                client_saga = await get_db_master_saga()
+                await client_saga.lrem(f"{OUTBOX_KEY}:processing", 0, raw)
+                await client_saga.lpush(OUTBOX_KEY, raw)
                 logging.warning(f"[Outbox] Failed to publish event, returning to queue: {routing_key}")
         except Exception as e:
             logging.error(f"Error publishing event: {str(e)}", exc_info=True)
@@ -1913,10 +2209,31 @@ async def health_check_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=8000)
     await site.start()
     logging.info("[Order Orchestrator] Health check server started on :8000")
+@worker.register
+async def health_check(data, message):
+    return {"status": "ok"}, 200
 
+async def close_all_redis_clients():
+    global _active_redis_clients
+    for client in _active_redis_clients:
+        try:
+            await client.aclose()
+        except Exception as e:
+            logging.warning(f"Failed to close Redis client: {e}")
+    _active_redis_clients.clear()
+
+@worker.register
+async def reset_redis_connections(data, message):
+    """Force reset all Redis master connections"""
+    global db_master_saga_cached, db_master_order_cached
+    db_master_saga_cached = None
+    db_master_order_cached = None
+    logging.info("Redis connections reset for failover testing")
+    return {"status": "Redis connections reset"}, 200
 
 async def main():
     try:
+        await warmup_redis_connections()
         await initialize_redis()
         await connect_rpc_client()
         asyncio.create_task(health_check_server())
@@ -1925,9 +2242,9 @@ async def main():
         asyncio.create_task(recover_in_progress_sagas())
         asyncio.create_task(outbox_poller())
         asyncio.create_task(periodic_lock_cleanup())
-
         await worker.start()
     finally:
+        await close_idempotency_redis_client()
         await close_db_connection()
 
 

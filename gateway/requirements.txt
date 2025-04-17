@@ -3,3 +3,4 @@ asyncio==3.4.3
 Hypercorn==0.17.3
 Quart==0.20.0
 uuid==1.30
+tenacity
