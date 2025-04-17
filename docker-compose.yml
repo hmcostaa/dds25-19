@@ -3,7 +3,9 @@ version: "3"
 networks:
   redis-cluster-network:
     driver: bridge
-
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
 
 
 services:
@@ -103,6 +105,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # extra_hosts:
+    #   - "redis-stock-master:172.18.0.50"
 
   redis-sentinel-2:
     image: redis:7.2-bookworm
@@ -121,7 +125,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+    # extra_hosts:
+    #   - "redis-stock-master:172.18.0.50"
   redis-sentinel-3:
     image: redis:7.2-bookworm
     container_name: redis-sentinel-3
@@ -139,6 +144,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    # extra_hosts:
+    #   - "redis-stock-master:172.18.0.50"
 
   # ------------------------- Redis Master-Replica for Order Service ----------
   redis-order-master:
@@ -149,7 +156,8 @@ services:
     ports:
       - "6379:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.51
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
@@ -194,10 +202,11 @@ services:
     ports:
       - "6380:6379"
     networks:
-       redis-cluster-network:
-         aliases:
+      redis-cluster-network:
+        aliases:
            - redis-stock-master
            - stock-master.local
+        ipv4_address: 172.18.0.50
 
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
@@ -244,7 +253,8 @@ services:
     ports:
       - "6381:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.52
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
@@ -289,7 +299,8 @@ services:
     ports:
       - "6382:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.53
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s

@@ -4,6 +4,7 @@ import atexit
 import time
 import uuid
 import asyncio
+from aiohttp import web
 import random
 from typing import Tuple, Dict, Any, Union 
 from common.amqp_worker import AMQPWorker
@@ -456,10 +457,30 @@ async def remove_stock(data, message):
         status_code = 500
         logging.warning(f"[remove_stock:RETURN] Returning error3 tuple: ({error_response}, {status_code})")
         return error_response, status_code 
+    
+async def health_check_server():
+    """
+    Runs a simple HTTP server on port 5000 to respond with 'OK' for readiness checks.
+    """
+
+    async def health_handler(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=5000)
+    await site.start()
+    logging.info("[Stock] Health check server started on :5000")
+
+
 async def main():
     try:
         await initialize_redis()
         await worker.start()
+        await health_check_server()
     finally:
         await close_db_connection()
 if __name__ == '__main__':

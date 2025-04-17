@@ -5,6 +5,7 @@ import sys
 import sys
 import uuid
 import asyncio
+from aiohttp import web
 import redis.asyncio as redis
 from quart import app
 from redis.asyncio.sentinel import Sentinel
@@ -566,11 +567,28 @@ async def compensate(data, message):
         logging.exception("Error canceling payment for user %s: %s", user_id, e)
         return {"error": f"Error canceling payment for user {user_id}: {e}"}, 400
 
+async def health_check_server():
+    """
+    Runs a simple HTTP server on port 5000 to respond with 'OK' for readiness checks.
+    """
+
+    async def health_handler(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=5000)
+    await site.start()
+    logging.info("[Stock] Health check server started on :5000")
 
 async def main():
     try:
         await initialize_redis()
         await worker.start()
+        await health_check_server()
     finally:
         await close_db_connection()
 
