@@ -3,6 +3,9 @@ version: "3"
 networks:
   redis-cluster-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
 
 
 
@@ -200,7 +203,8 @@ services:
     ports:
       - "6379:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.50
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
@@ -260,10 +264,12 @@ services:
     ports:
       - "6380:6379"
     networks:
-       redis-cluster-network:
-         aliases:
-           - redis-stock-master
-           - stock-master.local
+      redis-cluster-network:
+        aliases:
+          - redis-stock-master
+          - stock-master.local
+        ipv4_address: 172.18.0.51
+        
 
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
@@ -321,7 +327,9 @@ services:
     ports:
       - "6381:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.52
+
     environment:
       - REDIS_PASSWORD=redis
     healthcheck:
@@ -382,7 +390,8 @@ services:
     ports:
       - "6382:6379"
     networks:
-      - redis-cluster-network
+      redis-cluster-network:
+        ipv4_address: 172.18.0.53
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
       interval: 10s
