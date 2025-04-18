@@ -9,8 +9,9 @@ from aio_pika.abc import (
     AbstractIncomingMessage, AbstractQueue
 )
 
-logging.basicConfig(level=logging.INFO) 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class RpcClient:
     connection: AbstractConnection
@@ -24,7 +25,7 @@ class RpcClient:
         try:
             self.connection = await connect_robust(url)
             self.channel = await self.connection.channel()
-            queue_arguments={
+            queue_arguments = {
                 "x-dead-letter-exchange": "dead-letter-exchange",
                 "x-dead-letter-routing-key": "dead_letter"
             }
@@ -47,14 +48,16 @@ class RpcClient:
         if future:
             try:
                 decoded_body = json.loads(message.body.decode())
-                logging.info(f"--- RPC CLIENT ON_RESPONSE: Setting future result for CorrID {message.correlation_id}. Result: {decoded_body}")
+                logging.info(
+                    f"--- RPC CLIENT ON_RESPONSE: Setting future result for CorrID {message.correlation_id}. Result: {decoded_body}")
                 future.set_result(decoded_body)
             except Exception as e:
-                logging.exception(f"--- RPC CLIENT ON_RESPONSE: Error decoding/setting future result for CorrID {message.correlation_id}: {e}")
+                logging.exception(
+                    f"--- RPC CLIENT ON_RESPONSE: Error decoding/setting future result for CorrID {message.correlation_id}: {e}")
                 future.set_exception(e)
         else:
-            logging.info(f"--- RPC CLIENT ON_RESPONSE: Successfully set future result for CorrID {message.correlation_id}")
-            
+            logging.info(
+                f"--- RPC CLIENT ON_RESPONSE: Successfully set future result for CorrID {message.correlation_id}")
 
     async def call(self, queue: str, action: str, payload: object = None) -> object:
         correlation_id = str(uuid.uuid4())

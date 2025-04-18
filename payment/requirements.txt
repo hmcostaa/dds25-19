@@ -11,3 +11,5 @@ aio_pika==9.5.5
 pytest-asyncio
 pytest-mock==3.14.0
 quart
+tenacity
+aiohttp

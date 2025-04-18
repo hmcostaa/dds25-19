@@ -1,0 +1,549 @@
+#version: "3"
+#
+#networks:
+#  redis-cluster-network:
+#    driver: bridge
+#
+#
+#
+#services:
+#  rabbitmq:
+#    image: rabbitmq:3.9-management
+#    ports:
+#      - "5672:5672"
+#      - "15672:15672"
+#    environment:
+#      RABBITMQ_DEFAULT_USER: user
+#      RABBITMQ_DEFAULT_PASS: password
+#      RABBITMQ_ERLANG_COOKIE:  "QH2F75YqXvnb3dR8T4kzh9W1L6pLeZA3"
+#    healthcheck:
+#      test: ["CMD", "rabbitmqctl", "status"]
+#      interval: 10s
+#      timeout: 10s
+#      retries: 5
+#    networks:
+#      - redis-cluster-network
+#
+#  gateway1:
+#    build: ./gateway
+#    container_name: gateway1
+#    restart: on-failure
+#    ports:
+#      - "5001:5000"
+#    environment:
+#      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+#      PYTHONPATH: /usr/src/app
+#    volumes:
+#      - ./common:/usr/src/app/common
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 3
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      rabbitmq:
+#        condition: service_healthy
+#
+#  gateway2:
+#    build: ./gateway
+#    container_name: gateway2
+#    restart: on-failure
+#    ports:
+#      - "5002:5000"
+#    environment:
+#      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+#      PYTHONPATH: /usr/src/app
+#    depends_on:
+#      rabbitmq:
+#        condition: service_healthy
+#    volumes:
+#      - ./common:/usr/src/app/common
+#    healthcheck:
+#      test: [ "CMD", "curl", "-f", "http://localhost:5000/health" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 3
+#    networks:
+#      - redis-cluster-network
+#
+#  nginx-lb:
+#    image: nginx:latest
+#    container_name: nginx-load-balancer
+#    restart: always
+#    ports:
+#      - "8080:80"
+#    volumes:
+#      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#       gateway1:
+#          condition: service_healthy
+#       gateway2:
+#          condition: service_healthy
+#  # ------------------------- Redis Sentinel Cluster ----------------------------
+#  redis-sentinel-1:
+#    image: redis:7.2-bookworm
+#    container_name: redis-sentinel-1
+#    command: >
+#      bash -c "
+#        echo 'Waiting for Redis masters...' &&
+#        until redis-cli -h redis-order-master -a redis ping &&
+#              redis-cli -h redis-payment-master -a redis ping &&
+#              redis-cli -h redis-stock-master -a redis ping &&
+#              redis-cli -h redis-saga-master -a redis ping; do
+#          sleep 2
+#        done &&
+#        echo 'All Redis masters ready!' &&
+#        mkdir -p /tmp/sentinel &&
+#        cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf &&
+#        redis-sentinel /tmp/sentinel/sentinel.conf
+#      "
+##    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
+#    volumes:
+#      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
+#    depends_on:
+#      - redis-order-master
+#      - redis-payment-master
+#      - redis-stock-master
+#      - redis-saga-master
+#    ports:
+#      - "26379:26379"
+#    networks:
+#      - redis-cluster-network
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-sentinel-2:
+#    image: redis:7.2-bookworm
+#    container_name: redis-sentinel-2
+#    command: >
+#      bash -c "
+#        echo 'Waiting for Redis masters...' &&
+#        until redis-cli -h redis-order-master -a redis ping &&
+#              redis-cli -h redis-payment-master -a redis ping &&
+#              redis-cli -h redis-stock-master -a redis ping &&
+#              redis-cli -h redis-saga-master -a redis ping; do
+#          sleep 2
+#        done &&
+#        echo 'All Redis masters ready!' &&
+#        mkdir -p /tmp/sentinel &&
+#        cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf &&
+#        redis-sentinel /tmp/sentinel/sentinel.conf
+#      "
+##    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
+#    volumes:
+#      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
+#    ports:
+#      - "26380:26379"
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      - redis-sentinel-1
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-sentinel-3:
+#    image: redis:7.2-bookworm
+#    container_name: redis-sentinel-3
+#    command: >
+#      bash -c "
+#        echo 'Waiting for Redis masters...' &&
+#        until redis-cli -h redis-order-master -a redis ping &&
+#              redis-cli -h redis-payment-master -a redis ping &&
+#              redis-cli -h redis-stock-master -a redis ping &&
+#              redis-cli -h redis-saga-master -a redis ping; do
+#          sleep 2
+#        done &&
+#        echo 'All Redis masters ready!' &&
+#        mkdir -p /tmp/sentinel &&
+#        cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf &&
+#        redis-sentinel /tmp/sentinel/sentinel.conf
+#      "
+##    command: bash -c "mkdir -p /tmp/sentinel && cp /etc/redis/sentinel.conf.tmpl /tmp/sentinel/sentinel.conf && redis-sentinel /tmp/sentinel/sentinel.conf"
+#    volumes:
+#      - ./redis/sentinel.conf:/etc/redis/sentinel.conf.tmpl
+#    ports:
+#      - "26381:26379"
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      - redis-sentinel-1
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-p", "26379", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Redis Master-Replica for Order Service ----------
+#  redis-order-master:
+#    image: redis:7.2-bookworm
+#    container_name: redis-order-master
+#    command: ["redis-server", "--appendfsync",
+#              "everysec", "--requirepass", "redis",
+##              "--min-replicas-to-write", "1",
+##              "--min-replicas-max-lag", "10",
+#              "--protected-mode", "no",
+#              "--bind", "0.0.0.0" ]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    ports:
+#      - "6379:6379"
+#    networks:
+#      - redis-cluster-network
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-order-replica-1:
+#    image: redis:7.2-bookworm
+#    container_name: redis-order-replica-1
+#    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-order-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-order-replica-2:
+#    image: redis:7.2-bookworm
+#    container_name: redis-order-replica-2
+#    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-order-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Redis Master-Replica for Stock Service ----------
+#  redis-stock-master:
+#    image: redis:7.2-bookworm
+#    container_name: redis-stock-master
+#    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
+##              "--min-replicas-to-write",
+##              "1", "--min-replicas-max-lag", "10",
+#              "--protected-mode", "no", "--bind", "0.0.0.0"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    ports:
+#      - "6380:6379"
+#    networks:
+#       redis-cluster-network:
+#         aliases:
+#           - redis-stock-master
+#           - stock-master.local
+#
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-stock-replica-1:
+#    image: redis:7.2-bookworm
+#    container_name: redis-stock-replica-1
+#    command: ["redis-server", "--requirepass", "redis","--masterauth", "redis", "--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-stock-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-stock-replica-2:
+#    image: redis:7.2-bookworm
+#    container_name: redis-stock-replica-2
+#    command: ["redis-server", "--requirepass", "redis","--masterauth", "redis", "--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-stock-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Redis Master-Replica for Payment Service --------
+#  redis-payment-master:
+#    image: redis:7.2-bookworm
+#    container_name: redis-payment-master
+#    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
+##              "--min-replicas-to-write", "1", "--min-replicas-max-lag", "10",
+#              "--protected-mode", "no", "--bind", "0.0.0.0"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    ports:
+#      - "6381:6379"
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-payment-replica-1:
+#    image: redis:7.2-bookworm
+#    container_name: redis-payment-replica-1
+#    command: ["redis-server",  "--requirepass", "redis",  "--masterauth", "redis", "--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-payment-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-payment-replica-2:
+#    image: redis:7.2-bookworm
+#    container_name: redis-payment-replica-2
+#    command: ["redis-server",  "--requirepass", "redis",  "--masterauth", "redis", "--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-payment-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Redis Master-Replica for Saga State Repository --------
+#  redis-saga-master:
+#    image: redis:7.2-bookworm
+#    container_name: redis-saga-master
+#    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
+##              "--min-replicas-to-write", "1", "--min-replicas-max-lag", "10",
+#              "--protected-mode", "no", "--bind", "0.0.0.0"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    ports:
+#      - "6382:6379"
+#    networks:
+#      - redis-cluster-network
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-saga-replica-1:
+#    image: redis:7.2-bookworm
+#    container_name: redis-saga-replica-1
+#    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-saga-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  redis-saga-replica-2:
+#    image: redis:7.2-bookworm
+#    container_name: redis-saga-replica-2
+#    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
+#    volumes:
+#      - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
+#    networks:
+#      - redis-cluster-network
+#    environment:
+#      - REDIS_PASSWORD=redis
+#    depends_on:
+#      redis-saga-master:
+#        condition: service_healthy
+#    healthcheck:
+#      test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  order-service:
+#    build: ./order
+#    image: order:latest
+#    volumes:
+#      - ./common:/usr/src/app/order/common
+#      - ./global_idempotency:/usr/src/app/global_idempotency #for testing
+#    environment:
+#      PYTHONPATH: /usr/src/app
+#      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+#      SAGA_REDIS_HOST: redis-saga-master
+#      SAGA_REDIS_PORT: 6379
+#      SAGA_REDIS_PASSWORD: redis
+#      SAGA_REDIS_DB: 1
+#
+#      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+#      IDEMPOTENCY_REDIS_PASSWORD: redis
+#    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+#    env_file:
+#      - env/order_redis.env
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      redis-order-master:
+#        condition: service_healthy
+#      redis-saga-master:
+#        condition: service_healthy
+#      rabbitmq:
+#        condition: service_healthy
+#      redis-sentinel-1:
+#        condition: service_healthy
+#    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Stock Service & Orchestrator -----------------------------------
+#
+#  stock-service:
+#    build: ./stock
+#    image: stock:latest
+#    volumes:
+#      - ./common:/usr/src/app/stock/common
+#      - ./global_idempotency:/usr/src/app/global_idempotency
+#    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+#    environment:
+#      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+#      SAGA_REDIS_HOST: redis-saga-master
+#      SAGA_REDIS_PORT: 6379
+#      SAGA_REDIS_PASSWORD: redis
+#      SAGA_REDIS_DB: 1
+#
+#
+#      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+#      IDEMPOTENCY_REDIS_PASSWORD: redis
+#    # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+#
+#    env_file:
+#      - env/stock_redis.env
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      rabbitmq:
+#        condition: service_healthy
+#      # stock-db:
+#      #   condition: service_started
+#      redis-stock-master:
+#         condition: service_healthy
+#      redis-saga-master:
+#        condition: service_healthy
+#      redis-sentinel-1:
+#        condition: service_healthy
+#
+#    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#
+#  # ------------------------- Payment Service & Orchestrator -----------------------------------
+#
+#  payment-service:
+#    build: ./payment
+#    image: payment:latest
+#    volumes:
+#      - ./common:/usr/src/app/payment/common
+#      - ./global_idempotency:/usr/src/app/global_idempotency #for testing
+#    environment:
+#      REDIS_HOST: redis-payment-master
+#      REDIS_PORT: 6379
+#      REDIS_PASSWORD: redis
+#      REDIS_DB: 0
+#
+#      AMQP_URL: "amqp://user:password@rabbitmq:5672/"
+#      SAGA_REDIS_HOST: redis-saga-master
+#      SAGA_REDIS_PORT: 6379
+#      SAGA_REDIS_PASSWORD: redis
+#      SAGA_REDIS_DB: 1
+#
+#      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+#      IDEMPOTENCY_REDIS_PASSWORD: redis
+#
+#    env_file:
+#      - env/payment_redis.env
+#    networks:
+#      - redis-cluster-network
+#    depends_on:
+#      rabbitmq:
+#        condition: service_healthy
+#      redis-payment-master:
+#        condition: service_healthy
+#      redis-saga-master:
+#        condition: service_healthy
+#      redis-sentinel-1:
+#        condition: service_healthy
+#    healthcheck:
+#      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5

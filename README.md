@@ -57,7 +57,14 @@ Finally, the measurements are done in two phases:
 
 #### Interpreting results
 
-Wait for the script to finish and check how many inconsistencies you have in both the payment and stock services
+Wait for the script to finish and check how many inconsistencies you have in both the payment and stock services. 
+
+### Happy Path (All Services Up and Running):
+ We have observed zero inconsistency across all the logs and databases in this case.
+
+### Service Failover:
+For this case, we did observe zero inconsistency across the databases but for the logs, some sporodic inconsistencies were observed. One of the plausible reasons in this case would be the sync behavior orchestrated for an async system. However, the range for such inconsistencies lie in the range of 1-20 (depending on which the service was shutdown and restarted). 
+Some of the values obtained in these cases are also relevant to the number of retry and timeout operations performed.
 
 ### Stress test
 
@@ -89,10 +96,15 @@ With our locust file each user will make one request between 1 and 15 seconds (y
 > You can also create your own scenarios as you like (https://docs.locust.io/en/stable/writing-a-locustfile.html)
 
 
+
 #### Using the Locust UI
 Fill in an appropriate number of users that you want to test with.
 The hatch rate is how many users will spawn per second
 (locust suggests that you should use less than 100 in local mode).
+
+#### In terms of stress testing,
+Due to the bottleneck created by single rabbitmq or nginx load-balancer for now. 
+Thus, our system starts getting slower for 1000 user ramped up in 100 user/second. 
 
 #### Stress test with Kubernetes
 
@@ -105,14 +117,17 @@ and [original repo](https://github.com/GoogleCloudPlatform/distributed-load-test
 * `env`
     Folder containing the Redis env variables for the docker-compose deployment
 
-* `helm-config`
+* `helm-config`(not used)
    Helm chart values for Redis and ingress-nginx
 
-* `k8s`
+* `k8s`(not used)
     Folder containing the kubernetes deployments, apps and services for the ingress, order, payment and stock services.
 
 * `order`
     Folder containing the order application logic and dockerfile.
+
+* `global_idempotency`
+   Folder containing idempotency decorator function for idempotency db and app file. It is used for maintaining track of operations performed.
 
 * `payment`
     Folder containing the payment application logic and dockerfile.
@@ -122,3 +137,10 @@ and [original repo](https://github.com/GoogleCloudPlatform/distributed-load-test
 
 * `test`
     Folder containing some basic correctness tests for the entire system.
+
+## Run 
+```txt
+git clone https://github.com/hmcostaa/dds25-19
+cd dds25-19
+docker-compose up --build #start the project using dockers
+```
