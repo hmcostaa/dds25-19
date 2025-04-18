@@ -120,7 +120,7 @@ async def get_db_slave_stock():
         await handle_redis_connection_failure(e)
         raise
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
@@ -157,7 +157,7 @@ async def warmup_redis_connections():
 _idempotency_redis_client = None
 
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=0.2, min=0.2, max=2),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
@@ -216,7 +216,7 @@ class StockValue(Struct):
     stock: int
     price: int
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
@@ -246,7 +246,7 @@ async def get_item_from_db(item_id: str) -> Tuple[Union[StockValue, str], int]:
          return {"error": "Unexpected processing error"}, 500
 
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=0.25, min=0.25, max=4),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
@@ -271,7 +271,7 @@ async def call_atomic_update_with_retry(item_id: str, updater_func):
     return updated_item
 
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=0.25, min=0.25, max=4),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
@@ -333,8 +333,8 @@ async def atomic_update_item(item_id: str, update_func):
     return None, f"Failed to update item, retries nr??."
 
 @retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=0.2, min=0.1, max=2),
+    stop=stop_after_attempt(15),
+    wait=wait_exponential(multiplier=0.2, min=0.1, max=15),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
 )
@@ -431,7 +431,7 @@ async def add_stock(data, message):
         return ({"paid": False, "internal error": error_msg}, 400)
 
 @retry(
-    stop=stop_after_attempt(10),
+    stop=stop_after_attempt(15),
     wait=wait_exponential(multiplier=1, min=1, max=10),
     retry=retry_if_exception_type(RETRYABLE_REDIS_EXCEPTIONS),
     reraise=True
