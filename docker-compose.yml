@@ -7,8 +7,6 @@ networks:
       config:
         - subnet: 172.18.0.0/16
 
-
-
 services:
   rabbitmq:
     image: rabbitmq:3.9-management
