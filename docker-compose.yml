@@ -1,4 +1,3 @@
-
 version: "3"
 
 networks:
@@ -7,6 +6,8 @@ networks:
     ipam:
       config:
         - subnet: 172.18.0.0/16
+
+
 
 services:
   rabbitmq:
@@ -47,7 +48,7 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
-
+    
   gateway2:
     build: ./gateway
     container_name: gateway2
@@ -69,7 +70,7 @@ services:
       retries: 3
     networks:
       - redis-cluster-network
-
+  
   nginx-lb:
     image: nginx:latest
     container_name: nginx-load-balancer
@@ -189,8 +190,8 @@ services:
   redis-order-master:
     image: redis:7.2-bookworm
     container_name: redis-order-master
-    command: ["redis-server","/etc/redis/redis-acl.conf", "--appendfsync",
-              "everysec", "--requirepass", "redis","--masterauth", "redis","--masteruser", "default",
+    command: ["redis-server", "--appendfsync",
+              "everysec", "--requirepass", "redis",
 #              "--min-replicas-to-write", "1",
 #              "--min-replicas-max-lag", "10",
               "--protected-mode", "no",
@@ -213,7 +214,7 @@ services:
   redis-order-replica-1:
     image: redis:7.2-bookworm
     container_name: redis-order-replica-1
-    command: ["redis-server", "/etc/redis/redis-acl.conf", "--requirepass", "redis", "--masterauth", "redis","--masteruser", "default", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -232,7 +233,7 @@ services:
   redis-order-replica-2:
     image: redis:7.2-bookworm
     container_name: redis-order-replica-2
-    command: ["redis-server","/etc/redis/redis-acl.conf",  "--requirepass", "redis", "--masterauth", "redis","--masteruser", "default", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis", "--replicaof", "redis-order-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -252,7 +253,7 @@ services:
   redis-stock-master:
     image: redis:7.2-bookworm
     container_name: redis-stock-master
-    command: ["redis-server","/etc/redis/redis-acl.conf", "--appendfsync", "everysec", "--requirepass", "redis","--masterauth", "redis",
+    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
 #              "--min-replicas-to-write",
 #              "1", "--min-replicas-max-lag", "10",
               "--protected-mode", "no", "--bind", "0.0.0.0"]
@@ -268,7 +269,7 @@ services:
           - redis-stock-master
           - stock-master.local
         ipv4_address: 172.18.0.51
-
+        
 
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "redis", "ping" ]
@@ -279,7 +280,7 @@ services:
   redis-stock-replica-1:
     image: redis:7.2-bookworm
     container_name: redis-stock-replica-1
-    command: ["redis-server","/etc/redis/redis-acl.conf", "--requirepass", "redis","--masterauth", "redis","--masteruser", "default", "--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
+    command: ["redis-server", "--requirepass", "redis","--masterauth", "redis", "--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -298,7 +299,7 @@ services:
   redis-stock-replica-2:
     image: redis:7.2-bookworm
     container_name: redis-stock-replica-2
-    command: ["redis-server","/etc/redis/redis-acl.conf", "--requirepass", "redis","--masterauth", "redis", "--masteruser", "default","--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
+    command: ["redis-server", "--requirepass", "redis","--masterauth", "redis", "--replicaof", "redis-stock-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -318,7 +319,7 @@ services:
   redis-payment-master:
     image: redis:7.2-bookworm
     container_name: redis-payment-master
-    command: ["redis-server", "/etc/redis/redis-acl.conf","--appendfsync", "everysec", "--requirepass", "redis","--masterauth", "redis","--masteruser", "default",
+    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
 #              "--min-replicas-to-write", "1", "--min-replicas-max-lag", "10",
               "--protected-mode", "no", "--bind", "0.0.0.0"]
     volumes:
@@ -340,7 +341,7 @@ services:
   redis-payment-replica-1:
     image: redis:7.2-bookworm
     container_name: redis-payment-replica-1
-    command: ["redis-server", "/etc/redis/redis-acl.conf", "--requirepass", "redis",  "--masterauth", "redis","--masteruser", "default", "--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis",  "--masterauth", "redis", "--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -359,7 +360,7 @@ services:
   redis-payment-replica-2:
     image: redis:7.2-bookworm
     container_name: redis-payment-replica-2
-    command: ["redis-server",  "/etc/redis/redis-acl.conf","--requirepass", "redis",  "--masterauth", "redis", "--masteruser", "default","--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis",  "--masterauth", "redis", "--replicaof", "redis-payment-master", "6379", "--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -379,8 +380,7 @@ services:
   redis-saga-master:
     image: redis:7.2-bookworm
     container_name: redis-saga-master
-    command: ["redis-server","/etc/redis/redis-acl.conf", "--appendfsync", "everysec", "--requirepass", "redis","--masterauth", "redis",
-              "--masteruser", "default",
+    command: ["redis-server", "--appendfsync", "everysec", "--requirepass", "redis",
 #              "--min-replicas-to-write", "1", "--min-replicas-max-lag", "10",
               "--protected-mode", "no", "--bind", "0.0.0.0"]
     volumes:
@@ -401,7 +401,7 @@ services:
   redis-saga-replica-1:
     image: redis:7.2-bookworm
     container_name: redis-saga-replica-1
-    command: ["redis-server", "/etc/redis/redis-acl.conf", "--requirepass", "redis", "--masterauth", "redis","--masteruser", "default","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -420,7 +420,7 @@ services:
   redis-saga-replica-2:
     image: redis:7.2-bookworm
     container_name: redis-saga-replica-2
-    command: ["redis-server", "/etc/redis/redis-acl.conf", "--requirepass", "redis", "--masterauth", "redis","--masteruser", "default","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
+    command: ["redis-server",  "--requirepass", "redis", "--masterauth", "redis","--replicaof", "redis-saga-master", "6379","--protected-mode", "no"]
     volumes:
       - ./redis/redis-acl.conf:/etc/redis/redis-acl.conf
     networks:
@@ -450,7 +450,7 @@ services:
       SAGA_REDIS_PASSWORD: redis
       SAGA_REDIS_DB: 1
 
-      IDEMPOTENCY_REDIS_HOST: redis-saga-master
+      IDEMPOTENCY_REDIS_HOST: redis-saga-master 
       IDEMPOTENCY_REDIS_PASSWORD: redis
     # command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
